@@ -1,0 +1,6 @@
+python-telegram-bot[job-queue]
+python-dotenv
+groq
+requests
+sentence-transformers
+faiss-cpu
