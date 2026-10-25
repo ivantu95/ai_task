@@ -8,7 +8,11 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-token = os.environ["TELEGRAM_BOT_TOKEN"]
+token = os.environ.get("TELEGRAM_BOT_TOKEN")
+if not token:
+    print("Error: TELEGRAM_BOT_TOKEN is not set in your .env file.")
+    print("Please create a .env file (see .env.example) and add your token.")
+    exit(1)
 resp = requests.get(f"https://api.telegram.org/bot{token}/getUpdates").json()
 
 if not resp.get("result"):

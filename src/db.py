@@ -19,6 +19,22 @@ def init_db():
         )
     """)
     conn.execute("""
+        CREATE TABLE IF NOT EXISTS tasks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id INTEGER NOT NULL DEFAULT 0,
+            text TEXT NOT NULL,
+            due_time TEXT,
+            status TEXT NOT NULL DEFAULT 'pending',
+            created_at TEXT NOT NULL,
+            priority TEXT NOT NULL DEFAULT 'normal',
+            snooze_count INTEGER NOT NULL DEFAULT 0,
+            is_recurring INTEGER NOT NULL DEFAULT 0,
+            recurring_time TEXT,
+            exclude_days TEXT,
+            completed_at TEXT
+        )
+    """)
+    conn.execute("""
         CREATE TABLE IF NOT EXISTS recurring_logs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             task_id INTEGER NOT NULL,
@@ -46,12 +62,6 @@ def init_db():
     if "snooze_count" not in existing_columns:
         conn.execute("ALTER TABLE tasks ADD COLUMN snooze_count INTEGER NOT NULL DEFAULT 0")
 
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            chat_id INTEGER PRIMARY KEY,
-            created_at TEXT NOT NULL
-        )
-    """)
     conn.commit()
     conn.close()
 

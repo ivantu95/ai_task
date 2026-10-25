@@ -1,0 +1,18 @@
+[Unit]
+Description=Telegram AI Task Copilot
+After=network.target
+
+[Service]
+Type=simple
+# Имя пользователя сервера (например root или ваш пользователь):
+User=root
+# Путь к каталогу проекта на сервере:
+WorkingDirectory=/opt/Telegram_AI_Task_Copilot
+# Запуск через python виртуального окружения проекта:
+ExecStart=/opt/Telegram_AI_Task_Copilot/venv/bin/python -m src.telegram_bot
+Restart=always
+RestartSec=5
+EnvironmentFile=/opt/Telegram_AI_Task_Copilot/.env
+
+[Install]
+WantedBy=multi-user.target
