@@ -11,6 +11,7 @@ from datetime import datetime
 from groq import Groq
 
 _client = None
+_active_model = None
 
 
 def _get_groq_client() -> Groq:
@@ -21,6 +22,53 @@ def _get_groq_client() -> Groq:
             raise ValueError("GROQ_API_KEY is not set. Please set it in your .env file.")
         _client = Groq(api_key=api_key)
     return _client
+
+
+def _get_chat_model() -> str:
+    """Определяет доступную модель чата: либо из GROQ_MODEL,
+    либо автоматически выбирает лучшую доступную текстовую модель из аккаунта Groq."""
+    global _active_model
+    if _active_model:
+        return _active_model
+
+    custom_model = os.environ.get("GROQ_MODEL", "").strip()
+    if custom_model:
+        _active_model = custom_model
+        return _active_model
+
+    preferred_models = [
+        "llama-3.3-70b-versatile",
+        "llama-3.1-8b-instant",
+        "openai/gpt-oss-20b",
+        "llama3-8b-8192",
+        "llama3-70b-8192",
+        "mixtral-8x7b-32768",
+        "gemma2-9b-it",
+        "qwen-2.5-32b",
+    ]
+
+    try:
+        client = _get_groq_client()
+        models_data = client.models.list().data
+        available_ids = {m.id for m in models_data}
+
+        for model_id in preferred_models:
+            if model_id in available_ids:
+                _active_model = model_id
+                print(f"[Groq] Выбрана модель: {_active_model}")
+                return _active_model
+
+        # Если ни одна из списка не подошла, берем любую текстовую (не Whisper/Guard)
+        for m in models_data:
+            if "whisper" not in m.id and "guard" not in m.id:
+                _active_model = m.id
+                print(f"[Groq] Выбрана доступная модель из списка: {_active_model}")
+                return _active_model
+    except Exception as e:
+        print(f"[Groq] Предупреждение: не удалось получить список моделей: {e}")
+
+    _active_model = "llama-3.3-70b-versatile"
+    return _active_model
 
 
 SYSTEM_PROMPT = """Ты анализируешь входящее сообщение пользователя личному боту-ассистенту для задач и заметок.
@@ -76,16 +124,6 @@ SYSTEM_PROMPT = """Ты анализируешь входящее сообщен
 
 def parse_task(message: str) -> dict:
     now = datetime.now().strftime("%Y-%m-%d %H:%M, %A")
-    response = _get_groq_client().chat.completions.create(
-        model="llama-3.1-8b-instant",
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT.format(now=now)},
-            {"role": "user", "content": message},
-        ],
-        temperature=0,
-    )
-    raw = response.choices[0].message.content.strip()
-
     fallback = {
         "intent": "add_task",
         "task": message,
@@ -100,22 +138,36 @@ def parse_task(message: str) -> dict:
     }
 
     try:
+        model = _get_chat_model()
+        response = _get_groq_client().chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT.format(now=now)},
+                {"role": "user", "content": message},
+            ],
+            temperature=0,
+        )
+        raw = response.choices[0].message.content.strip()
+
         parsed = json.loads(raw)
-        if not isinstance(parsed, dict):
-            return fallback
+        if isinstance(parsed, dict):
+            parsed.setdefault("intent", "add_task")
+            parsed.setdefault("task", message)
+            parsed.setdefault("recurring", False)
+            parsed.setdefault("recurring_time", None)
+            parsed.setdefault("exclude_days", [])
+            parsed.setdefault("priority", "normal")
+            parsed.setdefault("task_number", None)
+            parsed.setdefault("snooze_minutes", None)
+            parsed.setdefault("search_query", None)
+            return parsed
     except json.JSONDecodeError:
         return fallback
+    except Exception as e:
+        print(f"[Groq] Ошибка в parse_task ({type(e).__name__}): {e}")
+        return fallback
 
-    parsed.setdefault("intent", "add_task")
-    parsed.setdefault("task", message)
-    parsed.setdefault("recurring", False)
-    parsed.setdefault("recurring_time", None)
-    parsed.setdefault("exclude_days", [])
-    parsed.setdefault("priority", "normal")
-    parsed.setdefault("task_number", None)
-    parsed.setdefault("snooze_minutes", None)
-    parsed.setdefault("search_query", None)
-    return parsed
+    return fallback
 
 
 def transcribe_voice(file_path: str) -> str:
@@ -148,12 +200,17 @@ def generate_history_answer(query: str, matches: list[dict]) -> str:
 Упоминай конкретные задачи и даты, если они есть.
 Если найденные совпадения не отвечают на вопрос прямо, честно скажи об этом, не выдумывая факты."""
 
-    response = _get_groq_client().chat.completions.create(
-        model="llama-3.1-8b-instant",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.3,
-    )
-    return response.choices[0].message.content.strip()
+    try:
+        model = _get_chat_model()
+        response = _get_groq_client().chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.3,
+        )
+        return response.choices[0].message.content.strip()
+    except Exception as e:
+        print(f"[Groq] Ошибка в generate_history_answer ({type(e).__name__}): {e}")
+        return f"Найдено в истории:\n{context_text}"
 
 
 def generate_weekly_insight(stats: dict) -> str:
@@ -174,9 +231,18 @@ def generate_weekly_insight(stats: dict) -> str:
 Сравни текущую неделю с прошлой.
 Если показатели невысокие — не критикуй, а поддержи и вдохнови на следующую неделю."""
 
-    response = _get_groq_client().chat.completions.create(
-        model="llama-3.1-8b-instant",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.7,
-    )
-    return response.choices[0].message.content.strip()
+    try:
+        model = _get_chat_model()
+        response = _get_groq_client().chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.7,
+        )
+        return response.choices[0].message.content.strip()
+    except Exception as e:
+        print(f"[Groq] Ошибка в generate_weekly_insight ({type(e).__name__}): {e}")
+        return (
+            f"За неделю создано задач: {stats['created_this_week']}, "
+            f"выполнено: {stats['done_this_week']} ({stats['completion_rate']}%). "
+            f"Регулярных привычек: {stats['recurring_completed_this_week']} из {stats['recurring_fired_this_week']}."
+        )

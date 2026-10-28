@@ -545,11 +545,24 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Глобальный обработчик ошибок Telegram."""
+    print(f"[Bot] Ошибка при обработке запроса: {context.error}")
+    if isinstance(update, Update) and update.effective_message:
+        try:
+            await update.effective_message.reply_text(
+                "⚠️ Не удалось обработать запрос. Пожалуйста, попробуйте еще раз."
+            )
+        except Exception:
+            pass
+
+
 def main():
     if not BOT_TOKEN:
         raise ValueError("TELEGRAM_BOT_TOKEN не задан. Укажите его в файле .env.")
     init_db()
     app = Application.builder().token(BOT_TOKEN).build()
+    app.add_error_handler(on_error)
 
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("list", list_tasks_cmd))
