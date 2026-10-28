@@ -13,25 +13,28 @@ system design — not just a CRUD app with a chatbot wrapper.
 ## Features
 
 ### Natural language task management
-- Add tasks by typing **or speaking** ("remind me to submit the report
-  tomorrow 6pm") — voice notes are transcribed via Groq Whisper and go
-  through the exact same pipeline as typed text.
-- A single LLM call classifies **intent** first (add a task? view a list?
-  mark something done? search? ask for insights?) and extracts structured
-  fields — so every feature below works via natural language, not just
-  slash commands.
+- Add tasks by typing **or speaking** ("напомни отправить отчет завтра в 18:00") — voice notes are transcribed via Groq Whisper (`whisper-large-v3`) and processed dynamically.
+- A single LLM call classifies **intent** first (add a task? view a list? mark something done? search? ask for insights?) and extracts structured fields — so every feature works via natural language, not just slash commands.
 
-### Reminders
-- **One-time reminders** with natural-language due times, including
-  relative ones ("in 5 minutes", "tomorrow evening") — the LLM computes the
-  exact timestamp.
-- **Recurring daily reminders** with day-of-week exclusions ("remind me
-  every day except Sunday to work out at 6pm").
-- **Priority detection** — words like "urgent" or "asap" mark a task high
-  priority, sorted to the top of lists with a 🔴 marker.
-- **Snooze**, with a **proactive nudge**: if the same reminder gets
-  snoozed 3+ times, the bot notices the pattern and suggests picking a
-  fixed, better time instead of repeatedly delaying.
+### Smart Voice Dictaphone (AudioPen / Oasis style)
+- **Умный диктофон мыслей**: при записи длинных голосовых сообщений (>18 сек или от 25 слов), бот распознает их как надиктованный поток мыслей или конспект встречи.
+- **Очистка от мусора**: AI автоматически удаляет оговорки, слова-паразиты («эээ», «ну», «как бы», «короче») и повторы.
+- **Структурированный конспект**: выделяет емкий заголовок (title), суть в 1-2 предложениях (summary) и ключевые тезисы списком (key_points).
+- **Автоизвлечение задач и напоминаний**: из монолога вычленяются все конкретные поручения, каждому назначается точный дедлайн, и они автоматически ставятся в базу с напоминаниями.
+- Также доступно для длинного текста через команду `/note <текст>` или `/memo <текст>`.
+
+### Live Interactive Checklist & Categories
+- **Live Checklist (`/list`)**: интерактивный список с инлайн-кнопками (`[1. ✅]`), позволяющий вычеркивать задачи прямо в сообщении в 1 клик без спама в чат.
+- **Категории (`#покупки`, `#работа`, `#личное`, `#идеи`)**: задачи автоматически классифицируются, между ними можно переключаться фильтрами прямо в чек-листе.
+- **Специализированный режим покупок (`/shopping`, `/buy`)**: удобный отдельный список продуктов и покупок с мгновенным вычеркиванием.
+
+### Reminders & Proactive Assistant
+- **One-time reminders** с поддержкой относительного времени («через 15 минут», «в эту пятницу в 11 утра») и таймзон.
+- **Интерактивные кнопки под напоминаниями**: при срабатывании бот сразу предлагает кнопки `[✅ Выполнено]`, `[⏰ +15 мин]`, `[⏰ +1 час]`, `[📅 На завтра]`, `[🗑 Удалить]`.
+- **Контрольный переспрос (Follow-up)**: если задача не была отмечена выполненной, через 45 минут бот аккуратно переспросит, удалось ли завершить дело.
+- **Вечерний обзор (Evening Wind-Down в 21:00)**: бот подводит итоги дня, хвалит за выполненное и предлагает кнопку переноса незакрытых задач на завтра.
+- **Recurring daily reminders** с исключениями дней недели («каждый день кроме воскресенья в 9:00»).
+- **Priority detection** — срочные задачи получают статус high priority и маркер 🔴 вверху списков.
 
 ### Search & history (RAG)
 - **Fast / Semantic search**:

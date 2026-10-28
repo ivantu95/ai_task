@@ -11,6 +11,7 @@
 - Контрольный переспрос невыполненных задач (Follow-up)
 - Подсветку просроченных дел (⚠️ просрочено)
 """
+import html
 import os
 import tempfile
 from collections import defaultdict
@@ -33,7 +34,10 @@ from src.db import (
     get_task_history, get_task_by_id, mark_task_reminded, update_task_due_time,
     get_tasks_completed_today, reschedule_overdue_tasks_to_tomorrow,
 )
-from src.llm_parser import parse_task, transcribe_voice, generate_weekly_insight, generate_history_answer
+from src.llm_parser import (
+    parse_task, transcribe_voice, generate_weekly_insight, generate_history_answer,
+    structure_smart_note,
+)
 from src.semantic_search import semantic_search
 
 WEEKDAY_NUMBERS = {"mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6}
@@ -513,11 +517,127 @@ def _mark_done_by_number(chat_id: int, task_number: int | None) -> str:
     return "Эта задача уже была завершена ранее."
 
 
+async def _process_smart_voice_note(chat_id: int, text: str, duration: int, job_queue) -> str:
+    """Обрабатывает длинный монолог/поток сознания (AudioPen style):
+    структурирует мысли, выделяет задачи с дедлайнами и сохраняет их в базу данных."""
+    smart = structure_smart_note(text)
+
+    title = smart.get("title") or "Голосовая заметка"
+    summary = smart.get("summary") or text
+    key_points = smart.get("key_points") or []
+    category = smart.get("category") or "general"
+    action_items = smart.get("action_items") or []
+
+    created_tasks = []
+    for item in action_items:
+        task_text = item.get("task", "").strip()
+        if not task_text:
+            continue
+        due_time = item.get("due_time")
+        priority = item.get("priority", "normal")
+        item_cat = item.get("category") or category
+        if item_cat not in RU_CATEGORIES and item_cat != "general":
+            item_cat = category
+
+        task_id = add_task(
+            chat_id=chat_id,
+            text=task_text,
+            due_time=due_time,
+            priority=priority,
+            snooze_count=0,
+            category=item_cat,
+        )
+        if due_time:
+            schedule_task_reminder(job_queue, chat_id, task_id, task_text, due_time, snooze_count=0)
+
+        created_tasks.append({
+            "id": task_id,
+            "text": task_text,
+            "due_time": due_time,
+            "priority": priority,
+            "category": item_cat,
+        })
+
+    saved_note_id = None
+    # Если задач не было, сохраняем саму мысль/заметку
+    if not created_tasks:
+        note_text = f"📝 {title}: {summary}"
+        saved_note_id = add_task(
+            chat_id=chat_id,
+            text=note_text,
+            due_time=None,
+            priority="normal",
+            snooze_count=0,
+            category=category,
+        )
+    elif len(key_points) >= 2 or len(summary) > 120:
+        # Если есть отдельный ценный контекст/мысли помимо задач, сохраняем конспект как заметку
+        note_text = f"📝 {title}: {summary}"
+        saved_note_id = add_task(
+            chat_id=chat_id,
+            text=note_text,
+            due_time=None,
+            priority="normal",
+            snooze_count=0,
+            category=category,
+        )
+
+    dur_str = f"{duration // 60}:{duration % 60:02d}" if duration else ""
+    dur_badge = f" (<i>{dur_str}</i>)" if dur_str else ""
+    tag = RU_CATEGORY_TAGS.get(category, "")
+
+    header = f"🎙 <b>Умная голосовая заметка</b>{dur_badge}{tag}" if duration else f"📝 <b>Умная заметка</b>{tag}"
+
+    blocks = [
+        header,
+        f"📌 <b>{html.escape(title)}</b>",
+        f"<b>Суть:</b>\n{html.escape(summary)}",
+    ]
+
+    if key_points:
+        points = "\n".join(f"• {html.escape(str(p))}" for p in key_points)
+        blocks.append(f"<b>Ключевые мысли:</b>\n{points}")
+
+    if created_tasks:
+        task_lines = []
+        for i, t in enumerate(created_tasks, 1):
+            mark = "🔴 " if t["priority"] == "high" else ""
+            t_due = f" (⏰ <i>{t['due_time']}</i>)" if t["due_time"] else ""
+            t_tag = RU_CATEGORY_TAGS.get(t["category"], "")
+            task_lines.append(f"{i}. {mark}{html.escape(t['text'])}{t_due}{t_tag} <code>[#{t['id']}]</code>")
+        blocks.append("📋 <b>Выделенные задачи:</b>\n" + "\n".join(task_lines))
+    elif saved_note_id:
+        blocks.append(f"<i>Сохранено в список заметок</i> <code>[#{saved_note_id}]</code>")
+
+    blocks.append("<i>Список дел: /list | Покупки: /shopping</i>")
+    return "\n\n".join(blocks)
+
+
+async def note_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда /note или /memo для текстовой структуризации мыслей и конспектов встреч."""
+    chat_id = update.effective_chat.id
+    register_user(chat_id)
+    if not context.args:
+        await update.message.reply_text("Использование: /note <напишите мысли, идею или итоги встречи>")
+        return
+
+    text = " ".join(context.args)
+    reply_html = await _process_smart_voice_note(chat_id, text, duration=0, job_queue=context.job_queue)
+    await update.message.reply_text(reply_html, parse_mode="HTML")
+
+
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Любое сообщение, не являющееся /командой, анализируется на намерение (intent)."""
     chat_id = update.effective_chat.id
     register_user(chat_id)
     text = update.message.text.strip()
+
+    words = text.split()
+    if len(words) >= 30 and len(text) >= 150:
+        reply_html = await _process_smart_voice_note(chat_id, text, duration=0, job_queue=context.job_queue)
+        await update.message.reply_text(reply_html, parse_mode="HTML")
+        return
+
     parsed = parse_task(text)
 
     intent = parsed.get("intent")
@@ -568,9 +688,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Скачивает голосовую заметку, транскрибирует через Groq Whisper
-    и направляет результат в общий пайплайн распознавания намерений."""
+    и направляет результат в умный диктофон (AudioPen) или общий пайплайн."""
     chat_id = update.effective_chat.id
     register_user(chat_id)
+
+    duration = update.message.voice.duration if update.message.voice else 0
 
     voice_file = await context.bot.get_file(update.message.voice.file_id)
     with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp:
@@ -581,6 +703,17 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = transcribe_voice(tmp_path)
     finally:
         os.remove(tmp_path)
+
+    if not text or not text.strip():
+        await update.message.reply_text("Не удалось распознать речь в голосовом сообщении. Попробуйте еще раз.")
+        return
+
+    words = text.strip().split()
+    # Если длинное голосовое (>18 сек и не менее 12 слов, либо от 25 слов) — включаем умный диктофон (AudioPen)
+    if (duration >= 18 and len(words) >= 12) or (len(words) >= 25):
+        reply_html = await _process_smart_voice_note(chat_id, text, duration, context.job_queue)
+        await update.message.reply_text(reply_html, parse_mode="HTML")
+        return
 
     parsed = parse_task(text)
     intent = parsed.get("intent")
@@ -903,6 +1036,7 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• «Что купить?» или /shopping ➔ интерактивный список покупок\n"
         "• /list ➔ список дел с кнопками зачеркивания в 1 клик\n\n"
         "✨ <b>Новые возможности:</b>\n"
+        "• <b>Умный диктофон (AudioPen)</b>: запишите длинное голосовое с мыслями — бот очистит от слов-паразитов, выделит тезисы и добавит задачи в расписание (или команда /note)\n"
         "• <b>Live Checklist</b>: нажимайте на кнопки прямо в сообщении, чтобы вычеркивать задачи\n"
         "• <b>Категории</b>: переключайтесь между #покупки, #работа, #личное, #идеи\n"
         "• <b>Вечерний обзор (21:00)</b>: бот покажет итоги дня и предложит сдвинуть несделанное на завтра\n"
@@ -910,6 +1044,7 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Основные команды:\n"
         "/list — интерактивный чек-лист дел\n"
         "/shopping — список покупок\n"
+        "/note <мысли> — структурировать длинную заметку/встречу\n"
         "/today — задачи на сегодня\n"
         "/bydate — дела по датам\n"
         "/recurring — регулярные привычки\n"
@@ -943,6 +1078,7 @@ def main():
     app.add_handler(CommandHandler("list", list_tasks_cmd))
     app.add_handler(CommandHandler("shopping", shopping_cmd))
     app.add_handler(CommandHandler("buy", shopping_cmd))
+    app.add_handler(CommandHandler(["note", "memo"], note_cmd))
     app.add_handler(CommandHandler("bydate", bydate_cmd))
     app.add_handler(CommandHandler("today", today_cmd))
     app.add_handler(CommandHandler("done", done_cmd))

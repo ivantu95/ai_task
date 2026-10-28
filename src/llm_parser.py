@@ -7,11 +7,18 @@
 import os
 import json
 from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from groq import Groq
 
 _client = None
 _active_model = None
+
+TIMEZONE_NAME = os.environ.get("TIMEZONE", "Europe/Moscow")
+try:
+    BOT_TZ = ZoneInfo(TIMEZONE_NAME)
+except Exception:
+    BOT_TZ = ZoneInfo("UTC")
 
 
 def _get_groq_client() -> Groq:
@@ -133,7 +140,7 @@ SYSTEM_PROMPT = """Ты анализируешь входящее сообщен
 
 
 def parse_task(message: str) -> dict:
-    now = datetime.now().strftime("%Y-%m-%d %H:%M, %A")
+    now = datetime.now(BOT_TZ).strftime("%Y-%m-%d %H:%M, %A")
     fallback = {
         "intent": "add_task",
         "task": message,
@@ -159,6 +166,13 @@ def parse_task(message: str) -> dict:
             temperature=0,
         )
         raw = response.choices[0].message.content.strip()
+        if raw.startswith("```"):
+            lines = raw.splitlines()
+            if lines[0].startswith("```"):
+                lines = lines[1:]
+            if lines and lines[-1].strip() == "```":
+                lines = lines[:-1]
+            raw = "\n".join(lines).strip()
 
         parsed = json.loads(raw)
         if isinstance(parsed, dict):
@@ -258,3 +272,79 @@ def generate_weekly_insight(stats: dict) -> str:
             f"выполнено: {stats['done_this_week']} ({stats['completion_rate']}%). "
             f"Регулярных привычек: {stats['recurring_completed_this_week']} из {stats['recurring_fired_this_week']}."
         )
+
+
+SMART_NOTE_PROMPT = """Ты — персональный AI-редактор заметок (в стиле AudioPen / Oasis).
+Пользователь надиктовал свои мысли, идеи или поток сознания в голосовом сообщении.
+Текущие дата и время: {now}
+
+Твоя задача:
+1. Очистить текст от слов-паразитов ("эээ", "ну", "короче", "в общем", "как бы", повторов, оговорок, сбивчивости).
+2. Придумать емкий и понятный заголовок (title).
+3. Сформулировать главную суть (summary) в 1-2 предложениях.
+4. Выделить ключевые мысли списком буллетов (key_points).
+5. Определить основную категорию (category): "work", "personal", "shopping", "ideas", "general".
+6. Извлечь любые конкретные задачи или напоминания с дедлайнами (action_items), упомянутые в речи.
+   Для каждого пункта action_items:
+   - task: четкая формулировка действия без лишних слов
+   - due_time: точный дедлайн (YYYY-MM-DD HH:MM), вычисленный строго от текущей даты выше. Если даты/времени нет, то null
+   - priority: "high" (если срочно/важно) или "normal"
+   - category: "work" | "personal" | "shopping" | "ideas" | "general"
+
+Ответь ТОЛЬКО валидным JSON, без какого-либо другого текста, без markdown-разметки (без ```json), строго в формате:
+{{
+  "title": "Емкий заголовок",
+  "summary": "Краткая суть мысли",
+  "key_points": ["Ключевой пункт 1", "Ключевой пункт 2"],
+  "category": "work" | "personal" | "shopping" | "ideas" | "general",
+  "action_items": [
+    {{"task": "Суть конкретного действия", "due_time": "YYYY-MM-DD HH:MM" или null, "priority": "high" или "normal", "category": "work" | "personal" | "shopping" | "ideas" | "general"}}
+  ]
+}}
+"""
+
+
+def structure_smart_note(text: str) -> dict:
+    """Превращает сбивчивый текст голосового сообщения в красивый структурированный конспект
+    с выделением сути, буллетов и задач с дедлайнами."""
+    now = datetime.now(BOT_TZ).strftime("%Y-%m-%d %H:%M, %A")
+    fallback = {
+        "title": "Голосовая заметка",
+        "summary": text,
+        "key_points": [],
+        "category": "general",
+        "action_items": [],
+    }
+
+    try:
+        model = _get_chat_model()
+        response = _get_groq_client().chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": SMART_NOTE_PROMPT.format(now=now)},
+                {"role": "user", "content": text},
+            ],
+            temperature=0.2,
+        )
+        raw = response.choices[0].message.content.strip()
+        if raw.startswith("```"):
+            lines = raw.splitlines()
+            if lines[0].startswith("```"):
+                lines = lines[1:]
+            if lines and lines[-1].strip() == "```":
+                lines = lines[:-1]
+            raw = "\n".join(lines).strip()
+
+        parsed = json.loads(raw)
+        if isinstance(parsed, dict):
+            parsed.setdefault("title", "Голосовая заметка")
+            parsed.setdefault("summary", text)
+            parsed.setdefault("key_points", [])
+            parsed.setdefault("category", "general")
+            parsed.setdefault("action_items", [])
+            return parsed
+    except Exception as e:
+        print(f"[Groq] Ошибка в structure_smart_note ({type(e).__name__}): {e}")
+        return fallback
+
+    return fallback
