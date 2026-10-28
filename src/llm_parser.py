@@ -6,7 +6,7 @@
 """
 import os
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from groq import Groq
@@ -131,15 +131,23 @@ SYSTEM_PROMPT = """Ты анализируешь входящее сообщен
 Для намерений, отличных от "add_task", оставляй неиспользуемые поля по умолчанию (null, false, []).
 
 Правила для РАЗОВЫХ задач и заметок (intent = add_task, recurring = false):
-- Если конкретная дата и время не указаны (чистая заметка, например: "купить хлеб", "идея: записать подкаст"), установи due_time в null и end_time в null.
 - Относительные даты ("завтра", "послезавтра", "в эту пятницу", "сегодня вечером") вычисляй строго от текущей даты выше.
 - Для фраз вроде "через N минут" или "через N часов", вычисли ТОЧНОЕ время: прибавь N минут/часов к текущему времени. Выполняй вычисления точно.
-- В поле task пиши чистую суть задачи, убирая слова вежливости и команды ("напомни мне", "запиши", "пожалуйста").
+- В поле task пиши чистую суть задачи, убирая слова вежливости и команды ("напомни мне", "запиши", "пожалуйста", "заметка").
+- ЗАДАЧИ БЕЗ ТОЧНОГО ЧАСА, НО С УКАЗАНИЕМ НА СЕГОДНЯ («в течение дня», «в течении дня», «за сегодня», «сегодня днем», «сегодня»):
+  * Такие задачи ОБЯЗАТЕЛЬНО должны получить дату на сегодня и контрольное время напоминания в due_time (а end_time = null):
+    - Если текущее время до 14:00 ➔ установи due_time на 15:00 ("YYYY-MM-DD 15:00").
+    - Если текущее время от 14:00 до 18:00 ➔ установи due_time на 18:00 ("YYYY-MM-DD 18:00").
+    - Если текущее время после 18:00 ➔ установи due_time на 20:00 (или через 1 час, но не позже 21:00).
+  * Если указано «завтра в течение дня» / «в течение завтрашнего дня» ➔ дата завтрашняя, due_time на 15:00 завтра, end_time = null.
+  * Для общих указаний времени суток: «утром» ➔ 10:00, «днем» / «в обед» ➔ 14:00, «вечером» ➔ 19:00.
 - ДИАПАЗОНЫ И ИНТЕРВАЛЫ ВРЕМЕНИ:
   Если указан интервал (например: "с 14:00 до 16:30", "завтра с 10 до 11:30", "18:00 - 19:30", "встреча 15:00-16:00"):
   * due_time — точные дата и время НАЧАЛА интервала ("YYYY-MM-DD HH:MM").
   * end_time — точные дата и время ОКОНЧАНИЯ интервала ("YYYY-MM-DD HH:MM").
   Если указано только одно время ("в 14:00") или нет времени, end_time = null.
+- Слово «заметка» не отменяет время! Если в заметке есть указание «в течение дня», «сегодня», «завтра» или точное время — извлеки due_time.
+- ТОЛЬКО если дата и время ВООБЩЕ не указаны (чистая бессрочная мысль, например: "купить хлеб", "идея: записать подкаст"), установи due_time в null и end_time в null.
 
 Правила для РЕГУЛЯРНЫХ задач (intent = add_task, recurring = true):
 - Применяется, если указано повторять регулярно / каждый день (например: "напоминай каждый день в 09:00 пить воду", "ежедневно бег в 07:30").
@@ -204,6 +212,27 @@ def parse_task(message: str) -> dict:
             parsed.setdefault("task_number", None)
             parsed.setdefault("snooze_minutes", None)
             parsed.setdefault("search_query", None)
+
+            # Программная страховка для задач "в течение дня" / "сегодня"
+            if parsed.get("intent") == "add_task" and not parsed.get("recurring") and not parsed.get("due_time"):
+                msg_lower = message.lower()
+                day_triggers = ("в течение дня", "в течении дня", "за сегодня", "сегодня днем", "в течение сегодняшнего", "в течении сегодняшнего")
+                if any(trig in msg_lower for trig in day_triggers):
+                    now_dt = datetime.now(BOT_TZ)
+                    if "завтра" in msg_lower:
+                        target_dt = now_dt + timedelta(days=1)
+                        parsed["due_time"] = target_dt.strftime("%Y-%m-%d 15:00")
+                    else:
+                        if now_dt.hour < 14:
+                            remind_time = "15:00"
+                        elif now_dt.hour < 18:
+                            remind_time = "18:00"
+                        elif now_dt.hour < 20:
+                            remind_time = "20:00"
+                        else:
+                            remind_time = (now_dt + timedelta(hours=1)).strftime("%H:%M") if now_dt.hour < 23 else "23:50"
+                        parsed["due_time"] = f"{now_dt.strftime('%Y-%m-%d')} {remind_time}"
+
             return parsed
     except json.JSONDecodeError:
         return fallback
@@ -305,8 +334,15 @@ SMART_NOTE_PROMPT = """Ты — персональный AI-редактор з�
 6. Извлечь любые конкретные задачи или напоминания с дедлайнами (action_items), упомянутые в речи.
    Для каждого пункта action_items:
    - task: четкая формулировка действия без лишних слов
-   - due_time: точный дедлайн или начало интервала (YYYY-MM-DD HH:MM), вычисленный строго от текущей даты выше. Если даты/времени нет, то null
-   - end_time: время окончания интервала (YYYY-MM-DD HH:MM), если указан диапазон (например "с 15:00 до 16:30"). Иначе null
+   - due_time: точный дедлайн или контрольное время напоминания (YYYY-MM-DD HH:MM), вычисленный строго от текущей даты выше:
+     * Если названо точное время (например "в 14:00", "завтра в 11:30") — используй его.
+     * Если сказано "в течение дня", "в течении дня", "сегодня", "за сегодня":
+       - если текущее время до 14:00: поставь 15:00 на сегодня
+       - если текущее время от 14:00 до 18:00: поставь 18:00 на сегодня
+       - если текущее время после 18:00: поставь 20:00 на сегодня
+     * Если сказано "утром" — 10:00, "днем/в обед" — 14:00, "вечером" — 19:00.
+     * Только если даты и времени совсем нет (чистая мысль/идея) — установи null.
+   - end_time: время окончания интервала (YYYY-MM-DD HH:MM), если указан диапазон (например "с 15:00 до 16:30"). Для задач "в течение дня" ставь null!
    - priority: "high" (если срочно/важно) или "normal"
    - category: "work" | "personal" | "shopping" | "ideas" | "general"
 
@@ -361,6 +397,29 @@ def structure_smart_note(text: str) -> dict:
             parsed.setdefault("key_points", [])
             parsed.setdefault("category", "general")
             parsed.setdefault("action_items", [])
+
+            # Программная страховка для пунктов "в течение дня" / "сегодня"
+            day_triggers = ("в течение дня", "в течении дня", "за сегодня", "сегодня днем", "в течение сегодняшнего", "в течении сегодняшнего")
+            for item in parsed.get("action_items", []):
+                if not item.get("due_time") and item.get("task"):
+                    combined = f"{item['task']} {text}".lower()
+                    if any(trig in combined for trig in day_triggers):
+                        now_dt = datetime.now(BOT_TZ)
+                        if "завтра" in combined:
+                            target_dt = now_dt + timedelta(days=1)
+                            item["due_time"] = target_dt.strftime("%Y-%m-%d 15:00")
+                        else:
+                            if now_dt.hour < 14:
+                                remind_time = "15:00"
+                            elif now_dt.hour < 18:
+                                remind_time = "18:00"
+                            elif now_dt.hour < 20:
+                                remind_time = "20:00"
+                            else:
+                                remind_time = (now_dt + timedelta(hours=1)).strftime("%H:%M") if now_dt.hour < 23 else "23:50"
+                            item["due_time"] = f"{now_dt.strftime('%Y-%m-%d')} {remind_time}"
+                        item["end_time"] = None
+
             return parsed
     except Exception as e:
         print(f"[Groq] Ошибка в structure_smart_note ({type(e).__name__}): {e}")

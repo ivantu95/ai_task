@@ -258,6 +258,9 @@ def _format_task_due(t: dict) -> str:
         return " (⏳ в процессе)"
 
     if not t.get("due_time"):
+        today_iso = date.today().isoformat()
+        if t.get("created_at", "").startswith(today_iso):
+            return " (📝 сегодня в течение дня)"
         return " (📝 заметка)"
 
     due_dt = _parse_due_datetime(t["due_time"])
@@ -413,8 +416,9 @@ def _build_today_reply(chat_id: int) -> str:
 
     todays_tasks = [
         t for t in tasks
-        if (t["due_time"] and t["due_time"].startswith(today_str))
+        if (t.get("due_time") and t["due_time"].startswith(today_str))
         or (t.get("status") in ("reminded", "in_progress"))
+        or (not t.get("due_time") and t.get("created_at", "").startswith(today_str) and t.get("category") != "shopping")
     ]
     if not todays_tasks:
         return "На сегодня нет запланированных задач."
@@ -430,8 +434,10 @@ def _build_today_reply(chat_id: int) -> str:
             suffix = " (⏳ в процессе)"
         elif due_dt and due_dt < now_dt:
             suffix = f" (⚠️ просрочено: {time_part})" if time_part else " ⚠️ (просрочено)"
+        elif time_part:
+            suffix = f" (в {time_part})"
         else:
-            suffix = f" (в {time_part})" if time_part else ""
+            suffix = " (📝 в течение дня)"
 
         tag = RU_CATEGORY_TAGS.get(t.get("category"), "")
         lines.append(f"{i + 1}. {mark}{t['text']}{suffix}{tag}")
@@ -1233,6 +1239,14 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
     elif action == "ev_tomorrow":
         tomorrow_09 = (datetime.now(BOT_TZ) + timedelta(days=1)).strftime("%Y-%m-%d 09:00")
         count = reschedule_overdue_tasks_to_tomorrow(chat_id, tomorrow_09)
+        # Регистрируем новые таймеры в job_queue на завтрашнее утро
+        for t in list_pending_tasks(chat_id):
+            if t.get("due_time") == tomorrow_09:
+                for job in context.job_queue.get_jobs_by_name(f"task_{chat_id}_{t['id']}"):
+                    job.schedule_removal()
+                schedule_task_reminder(
+                    context.job_queue, chat_id, t["id"], t["text"], tomorrow_09, snooze_count=0
+                )
         await query.edit_message_text(
             f"✨ Незавершенные задачи ({count} шт.) успешно перенесены на завтра в 09:00!\n"
             f"Хорошего вечера и приятного отдыха 🌙"
@@ -1340,11 +1354,18 @@ async def send_evening_review(context: ContextTypes.DEFAULT_TYPE):
         today_str = date.today().isoformat()
         now_dt = datetime.now(BOT_TZ)
 
-        # Невыполненные задачи, назначенные на сегодня или просроченные
+        # Невыполненные задачи, назначенные на сегодня, просроченные или созданные сегодня без точного времени
         overdue_or_today = [
             t for t in pending
-            if t.get("due_time") and (
-                t["due_time"].startswith(today_str) or (_parse_due_datetime(t["due_time"]) and _parse_due_datetime(t["due_time"]) < now_dt)
+            if (
+                t.get("due_time") and (
+                    t["due_time"].startswith(today_str) or (_parse_due_datetime(t["due_time"]) and _parse_due_datetime(t["due_time"]) < now_dt)
+                )
+            )
+            or (
+                not t.get("due_time")
+                and t.get("created_at", "").startswith(today_str)
+                and t.get("category") != "shopping"
             )
         ]
 

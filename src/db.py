@@ -118,14 +118,14 @@ def list_pending_tasks(chat_id: int, category: str | None = None) -> list[dict]:
     conn.row_factory = sqlite3.Row
     if category:
         rows = conn.execute(
-            """SELECT id, text, due_time, end_time, priority, snooze_count, status, category FROM tasks
+            """SELECT id, text, due_time, end_time, priority, snooze_count, status, category, created_at FROM tasks
                WHERE chat_id = ? AND status IN ('pending', 'reminded', 'in_progress') AND is_recurring = 0 AND category = ?
                ORDER BY CASE WHEN status = 'in_progress' THEN 0 WHEN priority = 'high' THEN 1 ELSE 2 END, id""",
             (chat_id, category),
         ).fetchall()
     else:
         rows = conn.execute(
-            """SELECT id, text, due_time, end_time, priority, snooze_count, status, category FROM tasks
+            """SELECT id, text, due_time, end_time, priority, snooze_count, status, category, created_at FROM tasks
                WHERE chat_id = ? AND status IN ('pending', 'reminded', 'in_progress') AND is_recurring = 0
                ORDER BY CASE WHEN status = 'in_progress' THEN 0 WHEN priority = 'high' THEN 1 ELSE 2 END, id""",
             (chat_id,),
@@ -153,8 +153,11 @@ def reschedule_overdue_tasks_to_tomorrow(chat_id: int, new_due_time: str) -> int
     cur = conn.execute(
         """UPDATE tasks SET due_time = ?, status = 'pending'
            WHERE chat_id = ? AND status IN ('pending', 'reminded', 'in_progress') AND is_recurring = 0
-           AND (due_time IS NOT NULL AND due_time <= ?)""",
-        (new_due_time, chat_id, now_iso + " 23:59"),
+           AND (
+               (due_time IS NOT NULL AND due_time <= ?)
+               OR (due_time IS NULL AND date(created_at) = ? AND category != 'shopping')
+           )""",
+        (new_due_time, chat_id, now_iso + " 23:59", now_iso),
     )
     conn.commit()
     count = cur.rowcount
@@ -410,7 +413,7 @@ def get_tasks_for_date(chat_id: int, date_str: str) -> list[dict]:
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     rows = conn.execute(
-        """SELECT id, text, due_time, end_time, priority, snooze_count, status, category FROM tasks
+        """SELECT id, text, due_time, end_time, priority, snooze_count, status, category, created_at FROM tasks
            WHERE chat_id = ? AND status IN ('pending', 'reminded', 'in_progress') AND is_recurring = 0
            AND (due_time LIKE ? OR (due_time IS NULL AND date(created_at) = ?))
            ORDER BY CASE WHEN status = 'in_progress' THEN 0 WHEN due_time IS NULL THEN 2 ELSE 1 END, due_time ASC, id ASC""",
