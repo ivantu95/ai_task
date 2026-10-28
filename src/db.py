@@ -113,21 +113,21 @@ def add_task(
 
 
 def list_pending_tasks(chat_id: int, category: str | None = None) -> list[dict]:
-    """Возвращает активные разовые задачи (включая reminded), опционально фильтруя по категории."""
+    """Возвращает активные разовые задачи (включая reminded и in_progress), опционально фильтруя по категории."""
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     if category:
         rows = conn.execute(
             """SELECT id, text, due_time, end_time, priority, snooze_count, status, category FROM tasks
-               WHERE chat_id = ? AND status IN ('pending', 'reminded') AND is_recurring = 0 AND category = ?
-               ORDER BY CASE WHEN priority = 'high' THEN 0 ELSE 1 END, id""",
+               WHERE chat_id = ? AND status IN ('pending', 'reminded', 'in_progress') AND is_recurring = 0 AND category = ?
+               ORDER BY CASE WHEN status = 'in_progress' THEN 0 WHEN priority = 'high' THEN 1 ELSE 2 END, id""",
             (chat_id, category),
         ).fetchall()
     else:
         rows = conn.execute(
             """SELECT id, text, due_time, end_time, priority, snooze_count, status, category FROM tasks
-               WHERE chat_id = ? AND status IN ('pending', 'reminded') AND is_recurring = 0
-               ORDER BY CASE WHEN priority = 'high' THEN 0 ELSE 1 END, id""",
+               WHERE chat_id = ? AND status IN ('pending', 'reminded', 'in_progress') AND is_recurring = 0
+               ORDER BY CASE WHEN status = 'in_progress' THEN 0 WHEN priority = 'high' THEN 1 ELSE 2 END, id""",
             (chat_id,),
         ).fetchall()
     conn.close()
@@ -152,7 +152,7 @@ def reschedule_overdue_tasks_to_tomorrow(chat_id: int, new_due_time: str) -> int
     now_iso = date.today().isoformat()
     cur = conn.execute(
         """UPDATE tasks SET due_time = ?, status = 'pending'
-           WHERE chat_id = ? AND status IN ('pending', 'reminded') AND is_recurring = 0
+           WHERE chat_id = ? AND status IN ('pending', 'reminded', 'in_progress') AND is_recurring = 0
            AND (due_time IS NOT NULL AND due_time <= ?)""",
         (new_due_time, chat_id, now_iso + " 23:59"),
     )
@@ -197,8 +197,21 @@ def mark_done(chat_id: int, task_id: int) -> bool:
     """Отмечает задачу выполненной (status='done')."""
     conn = sqlite3.connect(DB_PATH)
     cur = conn.execute(
-        "UPDATE tasks SET status = 'done', completed_at = ? WHERE id = ? AND chat_id = ? AND status IN ('pending', 'reminded')",
+        "UPDATE tasks SET status = 'done', completed_at = ? WHERE id = ? AND chat_id = ? AND status IN ('pending', 'reminded', 'in_progress')",
         (datetime.now().isoformat(), task_id, chat_id),
+    )
+    conn.commit()
+    updated = cur.rowcount > 0
+    conn.close()
+    return updated
+
+
+def mark_in_progress(chat_id: int, task_id: int) -> bool:
+    """Переводит задачу в статус 'in_progress' (пользователь уже выполняет её прямо сейчас)."""
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.execute(
+        "UPDATE tasks SET status = 'in_progress' WHERE id = ? AND chat_id = ? AND status IN ('pending', 'reminded', 'in_progress')",
+        (task_id, chat_id),
     )
     conn.commit()
     updated = cur.rowcount > 0
@@ -354,9 +367,9 @@ def search_tasks(chat_id: int, query: str) -> list[dict]:
     conn.row_factory = sqlite3.Row
     rows = conn.execute(
         """SELECT id, text, due_time, priority, status FROM tasks
-           WHERE chat_id = ? AND status IN ('pending', 'reminded') AND is_recurring = 0
+           WHERE chat_id = ? AND status IN ('pending', 'reminded', 'in_progress') AND is_recurring = 0
            AND text LIKE ?
-           ORDER BY CASE WHEN priority = 'high' THEN 0 ELSE 1 END, id""",
+           ORDER BY CASE WHEN status = 'in_progress' THEN 0 WHEN priority = 'high' THEN 1 ELSE 2 END, id""",
         (chat_id, f"%{query}%"),
     ).fetchall()
     conn.close()
@@ -398,9 +411,9 @@ def get_tasks_for_date(chat_id: int, date_str: str) -> list[dict]:
     conn.row_factory = sqlite3.Row
     rows = conn.execute(
         """SELECT id, text, due_time, end_time, priority, snooze_count, status, category FROM tasks
-           WHERE chat_id = ? AND status IN ('pending', 'reminded') AND is_recurring = 0
+           WHERE chat_id = ? AND status IN ('pending', 'reminded', 'in_progress') AND is_recurring = 0
            AND (due_time LIKE ? OR (due_time IS NULL AND date(created_at) = ?))
-           ORDER BY CASE WHEN due_time IS NULL THEN 1 ELSE 0 END, due_time ASC, id ASC""",
+           ORDER BY CASE WHEN status = 'in_progress' THEN 0 WHEN due_time IS NULL THEN 2 ELSE 1 END, due_time ASC, id ASC""",
         (chat_id, f"{date_str}%", date_str),
     ).fetchall()
     conn.close()
@@ -412,7 +425,7 @@ def get_task_dates_in_range(chat_id: int, start_date: str, end_date: str) -> set
     conn = sqlite3.connect(DB_PATH)
     rows = conn.execute(
         """SELECT DISTINCT substr(due_time, 1, 10) FROM tasks
-           WHERE chat_id = ? AND status IN ('pending', 'reminded') AND is_recurring = 0
+           WHERE chat_id = ? AND status IN ('pending', 'reminded', 'in_progress') AND is_recurring = 0
            AND due_time IS NOT NULL AND substr(due_time, 1, 10) BETWEEN ? AND ?""",
         (chat_id, start_date, end_date),
     ).fetchall()
@@ -447,7 +460,7 @@ def check_time_conflict(
     conn.row_factory = sqlite3.Row
     rows = conn.execute(
         """SELECT id, text, due_time, end_time, category FROM tasks
-           WHERE chat_id = ? AND status IN ('pending', 'reminded') AND is_recurring = 0
+           WHERE chat_id = ? AND status IN ('pending', 'reminded', 'in_progress') AND is_recurring = 0
            AND due_time LIKE ?""",
         (chat_id, f"{date_str}%"),
     ).fetchall()

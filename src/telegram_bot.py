@@ -34,6 +34,7 @@ from src.db import (
     get_task_history, get_task_by_id, mark_task_reminded, update_task_due_time,
     get_tasks_completed_today, reschedule_overdue_tasks_to_tomorrow,
     get_tasks_for_date, get_task_dates_in_range, check_time_conflict, find_task_by_text,
+    mark_in_progress,
 )
 from src.llm_parser import (
     parse_task, transcribe_voice, generate_weekly_insight, generate_history_answer,
@@ -89,11 +90,14 @@ def get_reminder_keyboard(task_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton("✅ Выполнено", callback_data=f"done:{task_id}"),
-            InlineKeyboardButton("⏰ +15 мин", callback_data=f"snooze:{task_id}:15"),
-            InlineKeyboardButton("⏰ +1 час", callback_data=f"snooze:{task_id}:60"),
+            InlineKeyboardButton("⏳ В процессе", callback_data=f"inp:{task_id}"),
         ],
         [
+            InlineKeyboardButton("⏰ +15 мин", callback_data=f"snooze:{task_id}:15"),
+            InlineKeyboardButton("⏰ +1 час", callback_data=f"snooze:{task_id}:60"),
             InlineKeyboardButton("📅 На завтра", callback_data=f"snooze:{task_id}:tomorrow"),
+        ],
+        [
             InlineKeyboardButton("🗑 Удалить", callback_data=f"del:{task_id}"),
         ],
     ])
@@ -104,9 +108,10 @@ def get_followup_keyboard(task_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton("✅ Да, сделано", callback_data=f"done:{task_id}"),
-            InlineKeyboardButton("⏰ Напомнить через 30 мин", callback_data=f"snooze:{task_id}:30"),
+            InlineKeyboardButton("⏳ В процессе", callback_data=f"inp:{task_id}"),
         ],
         [
+            InlineKeyboardButton("⏰ Напомнить через 30 мин", callback_data=f"snooze:{task_id}:30"),
             InlineKeyboardButton("📅 Перенести на завтра", callback_data=f"snooze:{task_id}:tomorrow"),
         ],
     ])
@@ -236,6 +241,8 @@ RU_WEEKDAYS_SHORT = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
 
 def _format_daily_time(t: dict) -> str:
     """Форматирует время для отображения в ежедневном расписании/календаре."""
+    if t.get("status") == "in_progress":
+        return "⏳ В процессе"
     if not t.get("due_time"):
         return "📝"
     start_time = t["due_time"].split(" ")[1] if " " in t["due_time"] else t["due_time"]
@@ -247,6 +254,9 @@ def _format_daily_time(t: dict) -> str:
 
 def _format_task_due(t: dict) -> str:
     """Форматирует метку времени (с учетом диапазона start - end) и подсветкой просроченных задач."""
+    if t.get("status") == "in_progress":
+        return " (⏳ в процессе)"
+
     if not t.get("due_time"):
         return " (📝 заметка)"
 
@@ -404,7 +414,7 @@ def _build_today_reply(chat_id: int) -> str:
     todays_tasks = [
         t for t in tasks
         if (t["due_time"] and t["due_time"].startswith(today_str))
-        or (t.get("status") == "reminded")
+        or (t.get("status") in ("reminded", "in_progress"))
     ]
     if not todays_tasks:
         return "На сегодня нет запланированных задач."
@@ -416,7 +426,9 @@ def _build_today_reply(chat_id: int) -> str:
         time_part = t["due_time"].split(" ")[1] if t.get("due_time") and " " in t["due_time"] else ""
         due_dt = _parse_due_datetime(t["due_time"]) if t.get("due_time") else None
 
-        if due_dt and due_dt < now_dt:
+        if t.get("status") == "in_progress":
+            suffix = " (⏳ в процессе)"
+        elif due_dt and due_dt < now_dt:
             suffix = f" (⚠️ просрочено: {time_part})" if time_part else " ⚠️ (просрочено)"
         else:
             suffix = f" (в {time_part})" if time_part else ""
@@ -684,6 +696,64 @@ def _mark_done_smart(
     return "Не понял, какую задачу отметить. Вы можете указать номер (например, /done 1) или написать: «сделал <название задачи>»."
 
 
+def _mark_in_progress_smart(
+    chat_id: int, task_number: int | None = None, task_text: str | None = None, job_queue=None
+) -> tuple[str, InlineKeyboardMarkup | None]:
+    """Умный перевод задачи в статус 'in_progress' по номеру или фрагменту текста."""
+    target_id = None
+    target_text = ""
+
+    if task_text:
+        matched = find_task_by_text(chat_id, task_text)
+        if matched:
+            target_id = matched["id"]
+            target_text = matched["text"]
+    elif task_number is not None:
+        target_id = _last_list_mapping.get(chat_id, {}).get(task_number)
+        if target_id is None:
+            active_tasks = list_pending_tasks(chat_id)
+            if 1 <= task_number <= len(active_tasks):
+                target_id = active_tasks[task_number - 1]["id"]
+                target_text = active_tasks[task_number - 1]["text"]
+
+        if target_id is not None and not target_text:
+            task = get_task_by_id(chat_id, target_id)
+            target_text = task.get("text", f"#{task_number}") if task else f"#{task_number}"
+    else:
+        fired = _last_fired.get(chat_id)
+        if fired:
+            text_fired, _ = fired
+            matched = find_task_by_text(chat_id, text_fired)
+            if matched:
+                target_id = matched["id"]
+                target_text = matched["text"]
+
+    if target_id is not None:
+        mark_in_progress(chat_id, target_id)
+        if job_queue:
+            for job in job_queue.get_jobs_by_name(f"followup_{chat_id}_{target_id}"):
+                job.schedule_removal()
+            for job in job_queue.get_jobs_by_name(f"task_{chat_id}_{target_id}"):
+                job.schedule_removal()
+
+        kb = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("✅ Завершить", callback_data=f"done:{target_id}"),
+                InlineKeyboardButton("⏰ Напомнить через 1 час", callback_data=f"snooze:{target_id}:60"),
+            ]
+        ])
+        return (
+            f"⏳ <b>В процессе:</b> «{target_text}»\n"
+            f"Отличный фокус! Не буду отвлекать уведомлениями. Как завершите — нажмите кнопку ниже:",
+            kb,
+        )
+
+    return (
+        "Не понял, какую задачу перевести в статус «В процессе». Укажите номер или название (например: «делаю отчет»).",
+        None,
+    )
+
+
 async def _process_smart_voice_note(chat_id: int, text: str, duration: int, job_queue) -> str:
     """Обрабатывает длинный монолог/поток сознания (AudioPen style):
     структурирует мысли, выделяет задачи с дедлайнами и сохраняет их в базу данных."""
@@ -856,6 +926,15 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         )
         return
+    if intent == "mark_in_progress":
+        reply_text, kb = _mark_in_progress_smart(
+            chat_id,
+            task_number=parsed.get("task_number"),
+            task_text=parsed.get("task"),
+            job_queue=context.job_queue,
+        )
+        await update.message.reply_text(reply_text, parse_mode="HTML", reply_markup=kb)
+        return
     if intent == "snooze":
         minutes = parsed.get("snooze_minutes") or 10
         for msg in await _snooze_last_fired(chat_id, minutes, context.job_queue):
@@ -949,6 +1028,15 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         await update.message.reply_text(f"🎙 Распознано: «{text}»\n\n{reply}")
         return
+    if intent == "mark_in_progress":
+        reply_text, kb = _mark_in_progress_smart(
+            chat_id,
+            task_number=parsed.get("task_number"),
+            task_text=parsed.get("task"),
+            job_queue=context.job_queue,
+        )
+        await update.message.reply_text(f"🎙 Распознано: «{text}»\n\n{reply_text}", parse_mode="HTML", reply_markup=kb)
+        return
     if intent == "snooze":
         minutes = parsed.get("snooze_minutes") or 10
         replies = await _snooze_last_fired(chat_id, minutes, context.job_queue)
@@ -1033,6 +1121,30 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             await query.edit_message_text(f"✅ Выполнено: «{task_text}»\nОтличная работа!")
         else:
             await query.edit_message_text("Задача уже отмечена выполненной.")
+
+    elif action == "inp":
+        task_id = int(parts[1])
+        task = get_task_by_id(chat_id, task_id)
+        task_text = task.get("text", "") if task else ""
+        mark_in_progress(chat_id, task_id)
+
+        for job in context.job_queue.get_jobs_by_name(f"followup_{chat_id}_{task_id}"):
+            job.schedule_removal()
+        for job in context.job_queue.get_jobs_by_name(f"task_{chat_id}_{task_id}"):
+            job.schedule_removal()
+
+        in_progress_kb = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("✅ Завершить", callback_data=f"done:{task_id}"),
+                InlineKeyboardButton("⏰ Напомнить через 1 час", callback_data=f"snooze:{task_id}:60"),
+            ]
+        ])
+        await query.edit_message_text(
+            f"⏳ <b>В процессе:</b> «{task_text}»\n"
+            f"Отличный фокус! Не буду отвлекать короткими напоминаниями. Как освободитесь — нажмите «Завершить»:",
+            parse_mode="HTML",
+            reply_markup=in_progress_kb,
+        )
 
     elif action == "chk":
         task_id = int(parts[1])
