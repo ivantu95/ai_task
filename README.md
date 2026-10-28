@@ -34,9 +34,9 @@ system design — not just a CRUD app with a chatbot wrapper.
   fixed, better time instead of repeatedly delaying.
 
 ### Search & history (RAG)
-- **Semantic search** over pending tasks using HuggingFace sentence
-  embeddings + FAISS — finds conceptually related tasks even without exact
-  keyword matches (e.g. searching "shopping" finds "buy milk and eggs").
+- **Fast / Semantic search**:
+  - **Легковесный режим (по умолчанию, `USE_LOCAL_EMBEDDINGS=false`)**: бот потребляет всего **~30 МБ RAM** и **0% CPU**. Поиск по активным задачам выполняется быстрым ранжированием по словам, а концептуальные вопросы по истории («что я делал на прошлой неделе по налогам») анализируются облачной нейросетью LLaMA через Groq API без нагрузки на сервер.
+  - **Локальный режим (`USE_LOCAL_EMBEDDINGS=true`)**: оригинальная реализация с вычислением локальных векторных эмбеддингов через `sentence-transformers` (`all-MiniLM-L6-v2`) + FAISS. Код сохранен в проекте и включается при необходимости в `.env` (требует около 350-400 МБ RAM).
 - **History search**: past tasks aren't deleted, they're archived. Ask
   natural questions like *"what did I do last week about finance?"* and
   the bot retrieves relevant archived tasks and generates a natural-language

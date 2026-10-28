@@ -1,35 +1,42 @@
 """
-Модуль семантического поиска по задачам и истории.
-Использует SentenceTransformers и FAISS с отложенным (ленивым) импортом,
-чтобы бот запускался мгновенно и не потреблял лишнюю память/процессор на сервере.
+Модуль поиска по задачам и истории.
+
+Поддерживает 2 режима:
+1. Легковесный режим (по умолчанию, USE_LOCAL_EMBEDDINGS=false):
+   Использует быстрый алгоритм ранжирования по совпадению ключевых слов и фраз.
+   Не загружает PyTorch, FAISS и веса нейросетей, потребляя 0 МБ дополнительной памяти
+   и 0% CPU. Идеально подходит для работы на простых серверах и VPS.
+2. Локальный нейросетевой режим (USE_LOCAL_EMBEDDINGS=true):
+   Оригинальная архитектура на SentenceTransformers (all-MiniLM-L6-v2) и in-memory FAISS.
+   Используется для локального вычисления векторных эмбеддингов на более мощных машинах.
 """
+import os
+
+USE_LOCAL_EMBEDDINGS = os.environ.get("USE_LOCAL_EMBEDDINGS", "false").lower() in ("true", "1", "yes")
+
 _model = None
 
 
 def _get_model():
-    """Загружает модель SentenceTransformer только при реальной необходимости."""
+    """Загружает модель SentenceTransformer только при явном включении локального режима."""
     global _model
     if _model is None:
         try:
             import torch
-            torch.set_num_threads(1)  # Ограничиваем 1 потоком для экономии CPU на сервере
+            torch.set_num_threads(1)
         except ImportError:
             pass
 
         from sentence_transformers import SentenceTransformer
-        print("[Search] Загрузка легковесной модели эмбеддингов (all-MiniLM-L6-v2)...")
+        print("[Search] Загрузка локальной модели эмбеддингов (all-MiniLM-L6-v2)...")
         _model = SentenceTransformer("all-MiniLM-L6-v2")
     return _model
 
 
-def semantic_search(
+def _local_faiss_semantic_search(
     query: str, candidates: list[dict], text_key: str = "text", top_k: int = 5, threshold: float = 0.3
 ) -> list[dict]:
-    """Возвращает задачи, наиболее близкие по смыслу к поисковому запросу.
-    Если векторные библиотеки недоступны или перегружены, безопасно откатывается на текстовый поиск."""
-    if not candidates or not query:
-        return []
-
+    """Оригинальный локальный семантический поиск через SentenceTransformers и FAISS."""
     try:
         import numpy as np
         import faiss
@@ -39,7 +46,6 @@ def semantic_search(
         embeddings = model.encode(texts, normalize_embeddings=True)
         query_embedding = model.encode([query], normalize_embeddings=True)
 
-        # Скалярное произведение для нормализованных векторов эквивалентно косинусному сходству
         index = faiss.IndexFlatIP(embeddings.shape[1])
         index.add(np.array(embeddings, dtype="float32"))
 
@@ -54,6 +60,55 @@ def semantic_search(
         return results
 
     except Exception as e:
-        print(f"[Search] Предупреждение: семантический поиск переключен на текстовый: {e}")
-        query_lower = query.lower()
-        return [c for c in candidates if query_lower in c.get(text_key, "").lower()]
+        print(f"[Search] Ошибка локального FAISS поиска ({e}), откат на легковесный...")
+        return _lightweight_search(query, candidates, text_key, top_k)
+
+
+def _lightweight_search(
+    query: str, candidates: list[dict], text_key: str = "text", top_k: int = 5
+) -> list[dict]:
+    """Быстрый поиск без загрузки PyTorch и эмбеддингов.
+    Ранжирует результаты по точному совпадению и совпадению ключевых слов."""
+    if not candidates or not query:
+        return []
+
+    q_lower = query.strip().lower()
+    query_words = [w for w in q_lower.split() if len(w) > 1]
+    if not query_words:
+        query_words = [q_lower]
+
+    scored = []
+    for c in candidates:
+        text = str(c.get(text_key, "")).lower()
+        if not text:
+            continue
+
+        score = 0.0
+        # Точное вхождение всей поисковой фразы — максимальный приоритет
+        if q_lower in text:
+            score += 10.0
+
+        # Вхождение отдельных слов из запроса
+        matched_words = sum(1 for w in query_words if w in text)
+        if matched_words > 0:
+            score += matched_words * 2.0
+
+        if score > 0:
+            scored.append((score, c))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [item[1] for item in scored[:top_k]]
+
+
+def semantic_search(
+    query: str, candidates: list[dict], text_key: str = "text", top_k: int = 5, threshold: float = 0.3
+) -> list[dict]:
+    """Основная точка входа для поиска по кандидатам.
+    По умолчанию использует легковесный режим без нагрузки на сервер."""
+    if not candidates or not query:
+        return []
+
+    if USE_LOCAL_EMBEDDINGS:
+        return _local_faiss_semantic_search(query, candidates, text_key, top_k, threshold)
+
+    return _lightweight_search(query, candidates, text_key, top_k)

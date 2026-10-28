@@ -170,10 +170,9 @@ def _build_history_reply(chat_id: int, query: str) -> str:
         return "В истории пока нет завершенных или сработавших задач."
 
     matches = semantic_search(query, history, text_key="text", top_k=8, threshold=0.25)
-    if not matches:
-        return f"По запросу «{query}» в истории ничего не найдено."
-
-    return generate_history_answer(query, matches)
+    # Если по ключевым словам ничего не найдено, передаем последние записи в облачную LLM для понимания смысла
+    candidates_for_ai = matches if matches else history[:25]
+    return generate_history_answer(query, candidates_for_ai)
 
 
 async def search_history_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
