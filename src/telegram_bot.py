@@ -2,6 +2,8 @@
 Основной модуль Telegram-бота.
 Использует long polling (не требует webhook, белого IP или ngrok)
 и JobQueue для надежной отправки запланированных напоминаний.
+Поддерживает интерактивные кнопки, автопроверку выполнения (follow-up)
+и учет просроченных задач.
 """
 import os
 import tempfile
@@ -12,14 +14,17 @@ from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 load_dotenv()
 
-from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Application, CommandHandler, MessageHandler, CallbackQueryHandler,
+    ContextTypes, filters,
+)
 
 from src.db import (
     init_db, add_task, list_pending_tasks, mark_done, register_user, list_all_chat_ids,
     add_recurring_task, list_recurring_tasks, delete_task, get_weekly_stats,
     log_recurring_fired, mark_recurring_done, get_recurring_weekly_stats,
-    archive_fired_task, get_task_history,
+    get_task_history, get_task_by_id, mark_task_reminded, update_task_due_time,
 )
 from src.llm_parser import parse_task, transcribe_voice, generate_weekly_insight, generate_history_answer
 from src.semantic_search import semantic_search
@@ -50,14 +55,91 @@ def _parse_due_datetime(due_time_str: str) -> datetime | None:
         return None
 
 
+def get_reminder_keyboard(task_id: int) -> InlineKeyboardMarkup:
+    """Клавиатура с быстрыми действиями под сработавшим напоминанием."""
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✅ Выполнено", callback_data=f"done:{task_id}"),
+            InlineKeyboardButton("⏰ +15 мин", callback_data=f"snooze:{task_id}:15"),
+            InlineKeyboardButton("⏰ +1 час", callback_data=f"snooze:{task_id}:60"),
+        ],
+        [
+            InlineKeyboardButton("📅 На завтра", callback_data=f"snooze:{task_id}:tomorrow"),
+            InlineKeyboardButton("🗑 Удалить", callback_data=f"del:{task_id}"),
+        ],
+    ])
+
+
+def get_followup_keyboard(task_id: int) -> InlineKeyboardMarkup:
+    """Клавиатура для контрольного переспроса."""
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✅ Да, сделано", callback_data=f"done:{task_id}"),
+            InlineKeyboardButton("⏰ Напомнить через 30 мин", callback_data=f"snooze:{task_id}:30"),
+        ],
+        [
+            InlineKeyboardButton("📅 Перенести на завтра", callback_data=f"snooze:{task_id}:tomorrow"),
+        ],
+    ])
+
+
+def get_recurring_keyboard(task_id: int) -> InlineKeyboardMarkup:
+    """Клавиатура для регулярной привычки."""
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✅ Выполнено сегодня", callback_data=f"rec_done:{task_id}"),
+            InlineKeyboardButton("⏰ Напомнить через 30 мин", callback_data=f"rec_snooze:{task_id}:30"),
+        ]
+    ])
+
+
 async def send_task_reminder(context: ContextTypes.DEFAULT_TYPE):
-    """Срабатывание разового напоминания. Задача архивируется (статус 'fired')
-    и исключается из активных, но остается доступной для поиска по истории."""
+    """Срабатывание разового напоминания.
+    Задача помечается как 'reminded' (остается в списке активных до закрытия),
+    отправляются кнопки и планируется контрольный переспрос."""
     chat_id = context.job.chat_id
     task_id, text, snooze_count = context.job.data
-    await context.bot.send_message(chat_id, f"⏰ Напоминание: {text}")
-    archive_fired_task(chat_id, task_id)
+    mark_task_reminded(chat_id, task_id)
     _last_fired[chat_id] = (text, snooze_count)
+
+    await context.bot.send_message(
+        chat_id,
+        f"⏰ <b>Напоминание:</b> {text}",
+        parse_mode="HTML",
+        reply_markup=get_reminder_keyboard(task_id),
+    )
+
+    # Планируем контрольный переспрос через 45 минут
+    schedule_followup_check(context.job_queue, chat_id, task_id, text, delay_minutes=45)
+
+
+def schedule_followup_check(job_queue, chat_id: int, task_id: int, text: str, delay_minutes: int = 45):
+    """Планирует контрольный опрос, если задача не будет выполнена вовремя."""
+    if not job_queue:
+        return
+    job_queue.run_once(
+        send_followup_reminder,
+        when=timedelta(minutes=delay_minutes),
+        chat_id=chat_id,
+        data=(task_id, text),
+        name=f"followup_{chat_id}_{task_id}",
+    )
+
+
+async def send_followup_reminder(context: ContextTypes.DEFAULT_TYPE):
+    """Контрольный переспрос: проверяет, была ли задача закрыта."""
+    chat_id = context.job.chat_id
+    task_id, text = context.job.data
+    task = get_task_by_id(chat_id, task_id)
+    if not task or task.get("status") == "done":
+        return
+
+    await context.bot.send_message(
+        chat_id,
+        f"🔔 <b>Контрольный вопрос:</b>\nЗадача «{text}» всё еще не отмечена выполненной.\nУдалось сделать?",
+        parse_mode="HTML",
+        reply_markup=get_followup_keyboard(task_id),
+    )
 
 
 def schedule_task_reminder(
@@ -75,11 +157,15 @@ def schedule_task_reminder(
 
 
 async def send_recurring_reminder(context: ContextTypes.DEFAULT_TYPE):
-    """Срабатывание регулярного напоминания. Не удаляется из базы,
-    а логируется в recurring_logs для учета привычек."""
+    """Срабатывание регулярного напоминания."""
     chat_id = context.job.chat_id
     task_id, text = context.job.data
-    await context.bot.send_message(chat_id, f"🔁 Регулярное напоминание: {text}\n\nНапиши «готово» или «сделано», когда выполнишь.")
+    await context.bot.send_message(
+        chat_id,
+        f"🔁 <b>Регулярное дело:</b> {text}",
+        parse_mode="HTML",
+        reply_markup=get_recurring_keyboard(task_id),
+    )
     _last_fired[chat_id] = (text, 0)
     _last_fired_recurring[chat_id] = task_id
     log_recurring_fired(chat_id, task_id)
@@ -111,6 +197,18 @@ def _group_by_date(tasks: list[dict]) -> dict[str, list[dict]]:
     return grouped
 
 
+def _format_task_due(t: dict) -> str:
+    """Форматирует метку времени с подсветкой просроченных задач."""
+    if not t.get("due_time"):
+        return " (📝 заметка)"
+
+    due_dt = _parse_due_datetime(t["due_time"])
+    now_dt = datetime.now(BOT_TZ)
+    if due_dt and due_dt < now_dt and t.get("status") != "done":
+        return f" ⚠️ (просрочено: {t['due_time']})"
+    return f" (⏰ {t['due_time']})"
+
+
 def _build_list_reply(chat_id: int) -> str:
     tasks = list_pending_tasks(chat_id)
     if not tasks:
@@ -119,8 +217,7 @@ def _build_list_reply(chat_id: int) -> str:
     lines = ["📋 Ваши активные задачи и заметки:"]
     for i, t in enumerate(tasks):
         mark = "🔴 " if t["priority"] == "high" else ""
-        due = f" (⏰ {t['due_time']})" if t["due_time"] else " (📝 заметка)"
-        lines.append(f"{i + 1}. {mark}{t['text']}{due}")
+        lines.append(f"{i + 1}. {mark}{t['text']}{_format_task_due(t)}")
     lines.append("\nЧтобы отметить выполненной: /done <номер>")
     return "\n".join(lines)
 
@@ -128,15 +225,28 @@ def _build_list_reply(chat_id: int) -> str:
 def _build_today_reply(chat_id: int) -> str:
     tasks = list_pending_tasks(chat_id)
     today_str = date.today().isoformat()
-    todays_tasks = [t for t in tasks if t["due_time"] and t["due_time"].startswith(today_str)]
+    now_dt = datetime.now(BOT_TZ)
+
+    todays_tasks = [
+        t for t in tasks
+        if (t["due_time"] and t["due_time"].startswith(today_str))
+        or (t.get("status") == "reminded")  # включаем сработавшие сегодня
+    ]
     if not todays_tasks:
         return "На сегодня нет запланированных задач."
+
     _last_list_mapping[chat_id] = {i + 1: t["id"] for i, t in enumerate(todays_tasks)}
     lines = ["📅 Задачи на сегодня:"]
     for i, t in enumerate(todays_tasks):
         mark = "🔴 " if t["priority"] == "high" else ""
-        time_part = t["due_time"].split(" ")[1] if " " in t["due_time"] else ""
-        suffix = f" (в {time_part})" if time_part else ""
+        time_part = t["due_time"].split(" ")[1] if t.get("due_time") and " " in t["due_time"] else ""
+        due_dt = _parse_due_datetime(t["due_time"]) if t.get("due_time") else None
+
+        if due_dt and due_dt < now_dt:
+            suffix = f" (⚠️ просрочено: {time_part})" if time_part else " ⚠️ (просрочено)"
+        else:
+            suffix = f" (в {time_part})" if time_part else ""
+
         lines.append(f"{i + 1}. {mark}{t['text']}{suffix}")
     lines.append("\nЧтобы отметить выполненной: /done <номер>")
     return "\n".join(lines)
@@ -155,8 +265,7 @@ def _build_search_reply(chat_id: int, query: str) -> str:
     lines = [f"🔍 Результаты поиска для «{query}» среди активных задач:"]
     for i, t in enumerate(matches):
         mark = "🔴 " if t["priority"] == "high" else ""
-        due = f" (⏰ {t['due_time']})" if t["due_time"] else " (📝 заметка)"
-        lines.append(f"{i + 1}. {mark}{t['text']}{due}")
+        lines.append(f"{i + 1}. {mark}{t['text']}{_format_task_due(t)}")
     lines.append("\nЧтобы отметить выполненной: /done <номер>")
     return "\n".join(lines)
 
@@ -167,10 +276,9 @@ def _build_history_reply(chat_id: int, query: str) -> str:
 
     history = get_task_history(chat_id)
     if not history:
-        return "В истории пока нет завершенных или сработавших задач."
+        return "В истории пока нет завершенных или архивных задач."
 
     matches = semantic_search(query, history, text_key="text", top_k=8, threshold=0.25)
-    # Если по ключевым словам ничего не найдено, передаем последние записи в облачную LLM для понимания смысла
     candidates_for_ai = matches if matches else history[:25]
     return generate_history_answer(query, candidates_for_ai)
 
@@ -211,10 +319,8 @@ def _build_bydate_reply(chat_id: int) -> str:
         lines = [header]
         for t in grouped[date_str]:
             mapping[counter] = t["id"]
-            time_part = t["due_time"].split(" ")[1] if t["due_time"] and " " in t["due_time"] else None
-            suffix = f" ({time_part})" if time_part else ""
             mark = "🔴 " if t["priority"] == "high" else ""
-            lines.append(f"  {counter}. {mark}{t['text']}{suffix}")
+            lines.append(f"  {counter}. {mark}{t['text']}{_format_task_due(t)}")
             counter += 1
         blocks.append("\n".join(lines))
 
@@ -249,6 +355,8 @@ async def done_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if mark_done(chat_id, task_id):
+        for job in context.job_queue.get_jobs_by_name(f"followup_{chat_id}_{task_id}"):
+            job.schedule_removal()
         await update.message.reply_text(f"Задача #{shown_number} выполнена! ✅")
     else:
         await update.message.reply_text("Эта задача уже была завершена ранее.")
@@ -447,7 +555,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def _snooze_last_fired(chat_id: int, minutes: int, job_queue) -> list[str]:
-    """Логика откладывания напоминания на N минут."""
+    """Логика откладывания последнего напоминания на N минут."""
     fired = _last_fired.get(chat_id)
     if fired is None:
         return ["Нет недавних сработавших напоминаний, которые можно отложить."]
@@ -455,9 +563,24 @@ async def _snooze_last_fired(chat_id: int, minutes: int, job_queue) -> list[str]
     text, prev_snooze_count = fired
     new_snooze_count = prev_snooze_count + 1
 
-    new_due = (datetime.now(BOT_TZ) + timedelta(minutes=minutes)).strftime("%Y-%m-%d %H:%M")
-    task_id = add_task(chat_id, text, new_due, snooze_count=new_snooze_count)
+    new_due_dt = datetime.now(BOT_TZ) + timedelta(minutes=minutes)
+    new_due = new_due_dt.strftime("%Y-%m-%d %H:%M")
+
+    tasks = list_pending_tasks(chat_id)
+    matching = [t for t in tasks if t["text"] == text]
+    if matching:
+        task_id = matching[0]["id"]
+        update_task_due_time(chat_id, task_id, new_due, new_snooze_count)
+    else:
+        task_id = add_task(chat_id, text, new_due, snooze_count=new_snooze_count)
+
+    for job in job_queue.get_jobs_by_name(f"task_{chat_id}_{task_id}"):
+        job.schedule_removal()
+    for job in job_queue.get_jobs_by_name(f"followup_{chat_id}_{task_id}"):
+        job.schedule_removal()
+
     schedule_task_reminder(job_queue, chat_id, task_id, text, new_due, snooze_count=new_snooze_count)
+    _last_fired[chat_id] = (text, new_snooze_count)
 
     messages = [f"Хорошо, напомню через {minutes} мин.: {text}"]
     if new_snooze_count >= 3:
@@ -467,6 +590,95 @@ async def _snooze_last_fired(chat_id: int, minutes: int, job_queue) -> list[str]
             f"Просто напиши новое время, и я обновлю напоминание."
         )
     return messages
+
+
+async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка нажатий на инлайн-кнопки под напоминаниями."""
+    query = update.callback_query
+    await query.answer()
+
+    chat_id = update.effective_chat.id
+    data = query.data or ""
+    parts = data.split(":")
+    action = parts[0]
+
+    if action == "done":
+        task_id = int(parts[1])
+        task = get_task_by_id(chat_id, task_id)
+        task_text = task.get("text", "") if task else ""
+        if mark_done(chat_id, task_id):
+            for job in context.job_queue.get_jobs_by_name(f"followup_{chat_id}_{task_id}"):
+                job.schedule_removal()
+            await query.edit_message_text(f"✅ Выполнено: «{task_text}»\nОтличная работа!")
+        else:
+            await query.edit_message_text("Задача уже отмечена выполненной.")
+
+    elif action == "snooze":
+        task_id = int(parts[1])
+        snooze_arg = parts[2]
+        task = get_task_by_id(chat_id, task_id)
+        if not task:
+            await query.edit_message_text("Задача не найдена.")
+            return
+
+        text = task.get("text", "")
+        prev_snooze_count = task.get("snooze_count", 0)
+        new_snooze_count = prev_snooze_count + 1
+
+        if snooze_arg == "tomorrow":
+            new_due_dt = (datetime.now(BOT_TZ) + timedelta(days=1)).replace(hour=9, minute=0)
+            time_label = "завтра в 09:00"
+        else:
+            mins = int(snooze_arg)
+            new_due_dt = datetime.now(BOT_TZ) + timedelta(minutes=mins)
+            time_label = f"через {mins} мин."
+
+        new_due = new_due_dt.strftime("%Y-%m-%d %H:%M")
+        update_task_due_time(chat_id, task_id, new_due, new_snooze_count)
+
+        for job in context.job_queue.get_jobs_by_name(f"task_{chat_id}_{task_id}"):
+            job.schedule_removal()
+        for job in context.job_queue.get_jobs_by_name(f"followup_{chat_id}_{task_id}"):
+            job.schedule_removal()
+
+        schedule_task_reminder(context.job_queue, chat_id, task_id, text, new_due, snooze_count=new_snooze_count)
+        _last_fired[chat_id] = (text, new_snooze_count)
+
+        nudge = ""
+        if new_snooze_count >= 3:
+            nudge = f"\n💡 Задача переносится уже {new_snooze_count}-й раз. Рекомендую выбрать удобное окно в расписании."
+
+        await query.edit_message_text(f"⏰ Напоминание отложено ({time_label}): «{text}»{nudge}")
+
+    elif action == "del":
+        task_id = int(parts[1])
+        for job in context.job_queue.get_jobs_by_name(f"task_{chat_id}_{task_id}"):
+            job.schedule_removal()
+        for job in context.job_queue.get_jobs_by_name(f"followup_{chat_id}_{task_id}"):
+            job.schedule_removal()
+        delete_task(chat_id, task_id)
+        await query.edit_message_text("🗑 Задача удалена.")
+
+    elif action == "rec_done":
+        task_id = int(parts[1])
+        mark_recurring_done(chat_id, task_id)
+        task = get_task_by_id(chat_id, task_id)
+        text = task.get("text", "") if task else ""
+        await query.edit_message_text(f"🔥 Привычка выполнена за сегодня: «{text}»\nТак держать!")
+
+    elif action == "rec_snooze":
+        task_id = int(parts[1])
+        mins = int(parts[2])
+        task = get_task_by_id(chat_id, task_id)
+        text = task.get("text", "привычка") if task else "привычка"
+        context.job_queue.run_once(
+            send_recurring_reminder,
+            when=timedelta(minutes=mins),
+            chat_id=chat_id,
+            data=(task_id, text),
+            name=f"rec_snooze_{chat_id}_{task_id}",
+        )
+        await query.edit_message_text(f"⏰ Напомню о привычке «{text}» через {mins} мин.")
 
 
 async def snooze_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -512,8 +724,7 @@ async def send_daily_reminder(context: ContextTypes.DEFAULT_TYPE):
 
         lines = ["☀️ Ваши активные дела и заметки:"]
         for i, t in enumerate(tasks):
-            due = f" (⏰ {t['due_time']})" if t["due_time"] else " (📝 заметка)"
-            lines.append(f"{i + 1}. {t['text']}{due}")
+            lines.append(f"{i + 1}. {t['text']}{_format_task_due(t)}")
         lines.append("\nЧтобы отметить задачу выполненной, используй /done <номер>.")
 
         _last_list_mapping[chat_id] = {i + 1: t["id"] for i, t in enumerate(tasks)}
@@ -529,7 +740,10 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• «Напомни позвонить врачу завтра в 15:30» — разовое напоминание\n"
         "• «Напоминай каждый день в 09:00 пить воду кроме воскресенья» — регулярная привычка\n"
         "• «Что у меня на сегодня?» или «Покажи список дел»\n"
-        "• «Что я делал на прошлой неделе по налогам?» — семантический поиск по истории\n\n"
+        "• «Что я делал на прошлой неделе по налогам?» — умный поиск в истории дел\n\n"
+        "💡 В напоминаниях доступны удобные кнопки в 1 клик:\n"
+        "[✅ Выполнено], [⏰ +15 мин], [⏰ +1 час], [📅 На завтра].\n"
+        "Если задача не выполнена, бот пришлет контрольный переспрос!\n\n"
         "Основные команды:\n"
         "/list — все задачи и заметки\n"
         "/today — дела на сегодня\n"
@@ -538,8 +752,8 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/recurring — регулярные напоминания\n"
         "/stoprecurring <номер> — отключить регулярное напоминание\n"
         "/snooze <минуты> — отложить последнее напоминание\n"
-        "/search <запрос> — семантический поиск по активным задачам\n"
-        "/history <вопрос> — умный поиск в истории дел\n"
+        "/search <запрос> — быстрый поиск среди дел\n"
+        "/history <вопрос> — поиск в истории выполненных задач\n"
         "/insights — сводка продуктивности"
     )
 
@@ -574,6 +788,7 @@ def main():
     app.add_handler(CommandHandler("insights", insights_cmd))
     app.add_handler(CommandHandler("search", search_cmd))
     app.add_handler(CommandHandler("history", search_history_cmd))
+    app.add_handler(CallbackQueryHandler(handle_callback_query))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 

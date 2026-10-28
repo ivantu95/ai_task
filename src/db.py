@@ -101,14 +101,13 @@ def add_task(
 
 
 def list_pending_tasks(chat_id: int) -> list[dict]:
-    """Only returns one-time tasks - recurring reminders are managed
-    separately since they never move to 'done', they just repeat.
-    High priority tasks are sorted to the top."""
+    """Возвращает активные разовые задачи (включая те, по которым уже звонило напоминание,
+    но они еще не выполнены). Задачи с высоким приоритетом идут первыми."""
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     rows = conn.execute(
-        """SELECT id, text, due_time, priority, snooze_count FROM tasks
-           WHERE chat_id = ? AND status = 'pending' AND is_recurring = 0
+        """SELECT id, text, due_time, priority, snooze_count, status FROM tasks
+           WHERE chat_id = ? AND status IN ('pending', 'reminded') AND is_recurring = 0
            ORDER BY CASE WHEN priority = 'high' THEN 0 ELSE 1 END, id""",
         (chat_id,),
     ).fetchall()
@@ -116,13 +115,42 @@ def list_pending_tasks(chat_id: int) -> list[dict]:
     return [dict(row) for row in rows]
 
 
+def get_task_by_id(chat_id: int, task_id: int) -> dict | None:
+    """Возвращает задачу по id и chat_id."""
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    row = conn.execute("SELECT * FROM tasks WHERE id = ? AND chat_id = ?", (task_id, chat_id)).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def mark_task_reminded(chat_id: int, task_id: int):
+    """Помечает задачу как напомненную (reminded), но оставляет в списке активных."""
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        "UPDATE tasks SET status = 'reminded' WHERE id = ? AND chat_id = ? AND status = 'pending'",
+        (task_id, chat_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def update_task_due_time(chat_id: int, task_id: int, new_due_time: str, snooze_count: int):
+    """Обновляет время выполнения и возвращает статус в pending при переносе/snooze."""
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        "UPDATE tasks SET due_time = ?, status = 'pending', snooze_count = ? WHERE id = ? AND chat_id = ?",
+        (new_due_time, snooze_count, task_id, chat_id),
+    )
+    conn.commit()
+    conn.close()
+
+
 def mark_done(chat_id: int, task_id: int) -> bool:
-    """Returns True if a pending task with this id, belonging to this
-    chat_id, was found and marked done. The chat_id check stops one user
-    from marking another user's task as done."""
+    """Отмечает задачу выполненной (status='done')."""
     conn = sqlite3.connect(DB_PATH)
     cur = conn.execute(
-        "UPDATE tasks SET status = 'done', completed_at = ? WHERE id = ? AND chat_id = ? AND status = 'pending'",
+        "UPDATE tasks SET status = 'done', completed_at = ? WHERE id = ? AND chat_id = ? AND status IN ('pending', 'reminded')",
         (datetime.now().isoformat(), task_id, chat_id),
     )
     conn.commit()
@@ -278,8 +306,8 @@ def search_tasks(chat_id: int, query: str) -> list[dict]:
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     rows = conn.execute(
-        """SELECT id, text, due_time, priority FROM tasks
-           WHERE chat_id = ? AND status = 'pending' AND is_recurring = 0
+        """SELECT id, text, due_time, priority, status FROM tasks
+           WHERE chat_id = ? AND status IN ('pending', 'reminded') AND is_recurring = 0
            AND text LIKE ?
            ORDER BY CASE WHEN priority = 'high' THEN 0 ELSE 1 END, id""",
         (chat_id, f"%{query}%"),
@@ -304,12 +332,12 @@ def archive_fired_task(chat_id: int, task_id: int):
 
 def get_task_history(chat_id: int, limit: int = 200) -> list[dict]:
     """Returns past tasks - both explicitly completed ('done') and reminders
-    that fired ('fired') - most recent first, for semantic history search."""
+    that fired ('fired' / 'reminded') - most recent first, for semantic history search."""
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     rows = conn.execute(
         """SELECT id, text, status, priority, created_at, completed_at FROM tasks
-           WHERE chat_id = ? AND status IN ('done', 'fired')
+           WHERE chat_id = ? AND status IN ('done', 'fired', 'reminded')
            ORDER BY COALESCE(completed_at, created_at) DESC LIMIT ?""",
         (chat_id, limit),
     ).fetchall()
