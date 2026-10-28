@@ -33,6 +33,7 @@ from src.db import (
     log_recurring_fired, mark_recurring_done, get_recurring_weekly_stats,
     get_task_history, get_task_by_id, mark_task_reminded, update_task_due_time,
     get_tasks_completed_today, reschedule_overdue_tasks_to_tomorrow,
+    get_tasks_for_date, get_task_dates_in_range, check_time_conflict, find_task_by_text,
 )
 from src.llm_parser import (
     parse_task, transcribe_voice, generate_weekly_insight, generate_history_answer,
@@ -223,16 +224,133 @@ def _group_by_date(tasks: list[dict]) -> dict[str, list[dict]]:
     return grouped
 
 
+RU_MONTH_GENITIVE = [
+    "января", "февраля", "марта", "апреля", "мая", "июня",
+    "июля", "августа", "сентября", "октября", "ноября", "декабря"
+]
+RU_WEEKDAYS_LONG = [
+    "Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота", "Воскресенье"
+]
+RU_WEEKDAYS_SHORT = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+
+
+def _format_daily_time(t: dict) -> str:
+    """Форматирует время для отображения в ежедневном расписании/календаре."""
+    if not t.get("due_time"):
+        return "📝"
+    start_time = t["due_time"].split(" ")[1] if " " in t["due_time"] else t["due_time"]
+    if t.get("end_time"):
+        end_time = t["end_time"].split(" ")[1] if " " in t["end_time"] else t["end_time"]
+        return f"⏱ {start_time} – {end_time}"
+    return f"⏰ {start_time}"
+
+
 def _format_task_due(t: dict) -> str:
-    """Форматирует метку времени с подсветкой просроченных задач."""
+    """Форматирует метку времени (с учетом диапазона start - end) и подсветкой просроченных задач."""
     if not t.get("due_time"):
         return " (📝 заметка)"
 
     due_dt = _parse_due_datetime(t["due_time"])
     now_dt = datetime.now(BOT_TZ)
-    if due_dt and due_dt < now_dt and t.get("status") != "done":
-        return f" ⚠️ (просрочено: {t['due_time']})"
-    return f" (⏰ {t['due_time']})"
+    is_overdue = due_dt and due_dt < now_dt and t.get("status") != "done"
+
+    start_part = t["due_time"]
+    end_part = t.get("end_time")
+
+    if end_part:
+        if start_part[:10] == end_part[:10] and " " in end_part:
+            time_range = f"{start_part} – {end_part.split(' ')[1]}"
+        else:
+            time_range = f"{start_part} – {end_part}"
+        prefix = "⚠️ (просрочено: " if is_overdue else " (⏱ "
+        return f" {prefix}{time_range})"
+
+    if is_overdue:
+        return f" ⚠️ (просрочено: {start_part})"
+    return f" (⏰ {start_part})"
+
+
+def _build_calendar_view(chat_id: int, target_date: date) -> tuple[str, InlineKeyboardMarkup]:
+    """Строит визуальный интерактивный календарь с сеткой недели и таймлайном выбранного дня."""
+    start_of_week = target_date - timedelta(days=target_date.weekday())
+    end_of_week = start_of_week + timedelta(days=6)
+
+    dates_with_tasks = get_task_dates_in_range(chat_id, start_of_week.isoformat(), end_of_week.isoformat())
+
+    # Кнопки дней недели (Row 1: Пн-Чт, Row 2: Пт-Вс)
+    week_buttons_row1 = []
+    week_buttons_row2 = []
+
+    for i in range(7):
+        cur_day = start_of_week + timedelta(days=i)
+        wd_name = RU_WEEKDAYS_SHORT[i]
+        day_num = cur_day.day
+
+        if cur_day == target_date:
+            btn_label = f"• {wd_name} {day_num} •"
+        elif cur_day.isoformat() in dates_with_tasks:
+            btn_label = f"{wd_name} {day_num}•"
+        else:
+            btn_label = f"{wd_name} {day_num}"
+
+        btn = InlineKeyboardButton(btn_label, callback_data=f"cal_d:{cur_day.isoformat()}")
+        if i < 4:
+            week_buttons_row1.append(btn)
+        else:
+            week_buttons_row2.append(btn)
+
+    # Кнопки навигации (Row 3)
+    prev_week = start_of_week - timedelta(days=7)
+    next_week = start_of_week + timedelta(days=7)
+    today_dt = date.today()
+
+    nav_row = [
+        InlineKeyboardButton("◀ Пред. неделя", callback_data=f"cal_w:{prev_week.isoformat()}"),
+        InlineKeyboardButton("Сегодня", callback_data=f"cal_d:{today_dt.isoformat()}"),
+        InlineKeyboardButton("След. неделя ▶", callback_data=f"cal_w:{next_week.isoformat()}"),
+    ]
+
+    # Данные за выбранный день
+    tasks = get_tasks_for_date(chat_id, target_date.isoformat())
+    day_name = RU_WEEKDAYS_LONG[target_date.weekday()]
+    month_name = RU_MONTH_GENITIVE[target_date.month - 1]
+
+    header = f"📅 <b>Календарь: {day_name}, {target_date.day} {month_name}</b>\n━━━━━━━━━━━━━━━━━━━━"
+
+    check_buttons = []
+    if not tasks:
+        content = "<i>✨ На этот день ничего не запланировано.</i>"
+    else:
+        # Локальная нумерация от 1 до N
+        _last_list_mapping[chat_id] = {i + 1: t["id"] for i, t in enumerate(tasks)}
+
+        lines = []
+        chk_row = []
+        for i, t in enumerate(tasks, 1):
+            time_badge = _format_daily_time(t)
+            mark = "🔴 " if t["priority"] == "high" else ""
+            tag = RU_CATEGORY_TAGS.get(t.get("category"), "")
+            lines.append(f"<b>{i}.</b> {time_badge} | {mark}{html.escape(t['text'])}{tag}")
+
+            chk_row.append(InlineKeyboardButton(f"{i}. ✅", callback_data=f"chk_cal:{t['id']}:{target_date.isoformat()}"))
+            if len(chk_row) == 4:
+                check_buttons.append(chk_row)
+                chk_row = []
+
+        if chk_row:
+            check_buttons.append(chk_row)
+
+        content = "\n".join(lines)
+
+    all_keyboard_rows = []
+    if check_buttons:
+        all_keyboard_rows.extend(check_buttons)
+    all_keyboard_rows.append(week_buttons_row1)
+    all_keyboard_rows.append(week_buttons_row2)
+    all_keyboard_rows.append(nav_row)
+
+    text_reply = f"{header}\n{content}"
+    return text_reply, InlineKeyboardMarkup(all_keyboard_rows)
 
 
 def _build_checklist(chat_id: int, category: str = "all") -> tuple[str, InlineKeyboardMarkup]:
@@ -409,23 +527,17 @@ async def today_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def done_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    if not context.args or not context.args[0].isdigit():
-        await update.message.reply_text("Использование: /done <номер из списка>")
+    register_user(chat_id)
+    if not context.args:
+        await update.message.reply_text("Использование: /done <номер> или /done <название задачи>")
         return
 
-    shown_number = int(context.args[0])
-    task_id = _last_list_mapping.get(chat_id, {}).get(shown_number)
-
-    if task_id is None:
-        await update.message.reply_text("Сначала посмотри номер задачи через /list или /today.")
-        return
-
-    if mark_done(chat_id, task_id):
-        for job in context.job_queue.get_jobs_by_name(f"followup_{chat_id}_{task_id}"):
-            job.schedule_removal()
-        await update.message.reply_text(f"Задача #{shown_number} выполнена! ✅")
+    arg = " ".join(context.args).strip()
+    if arg.isdigit():
+        reply = _mark_done_smart(chat_id, task_number=int(arg), job_queue=context.job_queue)
     else:
-        await update.message.reply_text("Эта задача уже была завершена ранее.")
+        reply = _mark_done_smart(chat_id, task_text=arg, job_queue=context.job_queue)
+    await update.message.reply_text(reply)
 
 
 def _build_recurring_reply(chat_id: int) -> str:
@@ -492,29 +604,84 @@ async def _process_parsed_task(chat_id: int, parsed: dict, job_queue) -> str:
 
     priority = parsed.get("priority", "normal")
     category = parsed.get("category", "general")
-    task_id = add_task(chat_id, parsed["task"], parsed.get("due_time"), priority, snooze_count=0, category=category)
-    schedule_task_reminder(job_queue, chat_id, task_id, parsed["task"], parsed.get("due_time"), snooze_count=0)
-    due = f" (⏰ срок: {parsed['due_time']})" if parsed.get("due_time") else " (📝 заметка)"
+    due_time = parsed.get("due_time")
+    end_time = parsed.get("end_time")
+
+    task_id = add_task(
+        chat_id, parsed["task"], due_time, priority, snooze_count=0, category=category, end_time=end_time
+    )
+    schedule_task_reminder(job_queue, chat_id, task_id, parsed["task"], due_time, snooze_count=0)
+
+    if due_time and end_time:
+        if due_time[:10] == end_time[:10] and " " in end_time:
+            due_str = f" (⏱ {due_time} – {end_time.split(' ')[1]})"
+        else:
+            due_str = f" (⏱ {due_time} – {end_time})"
+    elif due_time:
+        due_str = f" (⏰ {due_time})"
+    else:
+        due_str = " (📝 заметка)"
+
     mark = "🔴 " if priority == "high" else ""
     tag = RU_CATEGORY_TAGS.get(category, "")
-    return f"Добавлено [#{task_id}]: {mark}{parsed['task']}{due}{tag}"
+
+    # Проверка наложений (conflict detection)
+    conflict_note = ""
+    if due_time:
+        conflicts = check_time_conflict(chat_id, due_time, end_time, exclude_id=task_id)
+        if conflicts:
+            conflict_names = []
+            for c in conflicts[:2]:
+                c_time = c["due_time"].split(" ")[1] if " " in c["due_time"] else c["due_time"]
+                if c.get("end_time") and " " in c["end_time"]:
+                    c_time = f"{c_time} – {c['end_time'].split(' ')[1]}"
+                conflict_names.append(f"«{c['text']}» ({c_time})")
+            conflict_note = f"\n⚠️ <i>Внимание: пересекается по времени с {', '.join(conflict_names)}</i>"
+
+    return f"✅ <b>Добавлено:</b> {mark}{html.escape(parsed['task'])}{due_str}{tag}{conflict_note}"
 
 
-def _mark_done_by_number(chat_id: int, task_number: int | None) -> str:
-    if task_number is None:
-        recurring_task_id = _last_fired_recurring.get(chat_id)
-        if recurring_task_id is not None:
-            mark_recurring_done(chat_id, recurring_task_id)
-            return "Отлично! Регулярная привычка отмечена выполненной за сегодня. 🔥"
-        return "Не понял, какую задачу отметить. Открой /list и укажи номер (например: /done 1)."
+def _mark_done_smart(
+    chat_id: int, task_number: int | None = None, task_text: str | None = None, job_queue=None
+) -> str:
+    """Умное завершение задачи по номеру или фрагменту названия."""
+    target_id = None
+    target_text = ""
 
-    task_id = _last_list_mapping.get(chat_id, {}).get(task_number)
-    if task_id is None:
-        return "Сначала посмотри номер задачи через /list или /today, затем вызови /done <номер>."
+    # 1. Поиск по тексту (например: "я купил молоко", "сдал отчет")
+    if task_text:
+        matched = find_task_by_text(chat_id, task_text)
+        if matched:
+            target_id = matched["id"]
+            target_text = matched["text"]
 
-    if mark_done(chat_id, task_id):
-        return f"Задача #{task_number} выполнена! ✅"
-    return "Эта задача уже была завершена ранее."
+    # 2. Поиск по локальному номеру
+    elif task_number is not None:
+        target_id = _last_list_mapping.get(chat_id, {}).get(task_number)
+        if target_id is None:
+            active_tasks = list_pending_tasks(chat_id)
+            if 1 <= task_number <= len(active_tasks):
+                target_id = active_tasks[task_number - 1]["id"]
+                target_text = active_tasks[task_number - 1]["text"]
+
+        if target_id is not None and not target_text:
+            task = get_task_by_id(chat_id, target_id)
+            target_text = task.get("text", f"#{task_number}") if task else f"#{task_number}"
+
+    if target_id is not None:
+        if mark_done(chat_id, target_id):
+            if job_queue:
+                for job in job_queue.get_jobs_by_name(f"followup_{chat_id}_{target_id}"):
+                    job.schedule_removal()
+            return f"✅ Выполнено: «{target_text}»!"
+        return f"Задача «{target_text}» уже была завершена ранее."
+
+    recurring_task_id = _last_fired_recurring.get(chat_id)
+    if recurring_task_id is not None:
+        mark_recurring_done(chat_id, recurring_task_id)
+        return "Отлично! Регулярная привычка отмечена выполненной за сегодня. 🔥"
+
+    return "Не понял, какую задачу отметить. Вы можете указать номер (например, /done 1) или написать: «сделал <название задачи>»."
 
 
 async def _process_smart_voice_note(chat_id: int, text: str, duration: int, job_queue) -> str:
@@ -534,6 +701,7 @@ async def _process_smart_voice_note(chat_id: int, text: str, duration: int, job_
         if not task_text:
             continue
         due_time = item.get("due_time")
+        end_time = item.get("end_time")
         priority = item.get("priority", "normal")
         item_cat = item.get("category") or category
         if item_cat not in RU_CATEGORIES and item_cat != "general":
@@ -546,6 +714,7 @@ async def _process_smart_voice_note(chat_id: int, text: str, duration: int, job_
             priority=priority,
             snooze_count=0,
             category=item_cat,
+            end_time=end_time,
         )
         if due_time:
             schedule_task_reminder(job_queue, chat_id, task_id, task_text, due_time, snooze_count=0)
@@ -554,6 +723,7 @@ async def _process_smart_voice_note(chat_id: int, text: str, duration: int, job_
             "id": task_id,
             "text": task_text,
             "due_time": due_time,
+            "end_time": end_time,
             "priority": priority,
             "category": item_cat,
         })
@@ -602,14 +772,23 @@ async def _process_smart_voice_note(chat_id: int, text: str, duration: int, job_
         task_lines = []
         for i, t in enumerate(created_tasks, 1):
             mark = "🔴 " if t["priority"] == "high" else ""
-            t_due = f" (⏰ <i>{t['due_time']}</i>)" if t["due_time"] else ""
+            if t.get("end_time") and t.get("due_time"):
+                if t["due_time"][:10] == t["end_time"][:10] and " " in t["end_time"]:
+                    t_due = f" (⏱ <i>{t['due_time']} – {t['end_time'].split(' ')[1]}</i>)"
+                else:
+                    t_due = f" (⏱ <i>{t['due_time']} – {t['end_time']}</i>)"
+            elif t.get("due_time"):
+                t_due = f" (⏰ <i>{t['due_time']}</i>)"
+            else:
+                t_due = ""
             t_tag = RU_CATEGORY_TAGS.get(t["category"], "")
-            task_lines.append(f"{i}. {mark}{html.escape(t['text'])}{t_due}{t_tag} <code>[#{t['id']}]</code>")
+            task_lines.append(f"{i}. {mark}{html.escape(t['text'])}{t_due}{t_tag}")
         blocks.append("📋 <b>Выделенные задачи:</b>\n" + "\n".join(task_lines))
     elif saved_note_id:
-        blocks.append(f"<i>Сохранено в список заметок</i> <code>[#{saved_note_id}]</code>")
+        blocks.append("<i>Сохранено в список заметок</i>")
 
-    blocks.append("<i>Список дел: /list | Покупки: /shopping</i>")
+    blocks.append("<i>Список дел: /list | Календарь: /calendar | Покупки: /shopping</i>")
+    return "\n\n".join(blocks)
     return "\n\n".join(blocks)
 
 
@@ -649,6 +828,17 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if intent == "show_today":
         await update.message.reply_text(_build_today_reply(chat_id), parse_mode="HTML")
         return
+    if intent == "show_calendar":
+        target_str = parsed.get("target_date")
+        target_dt = date.today()
+        if target_str:
+            try:
+                target_dt = date.fromisoformat(target_str)
+            except Exception:
+                target_dt = date.today()
+        text_reply, kb = _build_calendar_view(chat_id, target_dt)
+        await update.message.reply_text(text_reply, parse_mode="HTML", reply_markup=kb)
+        return
     if intent == "show_list":
         text_reply, kb = _build_checklist(chat_id, category="all")
         await update.message.reply_text(text_reply, parse_mode="HTML", reply_markup=kb)
@@ -657,7 +847,14 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(_build_bydate_reply(chat_id))
         return
     if intent == "mark_done":
-        await update.message.reply_text(_mark_done_by_number(chat_id, parsed.get("task_number")))
+        await update.message.reply_text(
+            _mark_done_smart(
+                chat_id,
+                task_number=parsed.get("task_number"),
+                task_text=parsed.get("task"),
+                job_queue=context.job_queue,
+            )
+        )
         return
     if intent == "snooze":
         minutes = parsed.get("snooze_minutes") or 10
@@ -725,6 +922,17 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if intent == "show_today":
         await update.message.reply_text(f"🎙 Распознано: «{text}»\n\n{_build_today_reply(chat_id)}", parse_mode="HTML")
         return
+    if intent == "show_calendar":
+        target_str = parsed.get("target_date")
+        target_dt = date.today()
+        if target_str:
+            try:
+                target_dt = date.fromisoformat(target_str)
+            except Exception:
+                target_dt = date.today()
+        text_reply, kb = _build_calendar_view(chat_id, target_dt)
+        await update.message.reply_text(f"🎙 Распознано: «{text}»\n\n{text_reply}", parse_mode="HTML", reply_markup=kb)
+        return
     if intent == "show_list":
         text_reply, kb = _build_checklist(chat_id, category="all")
         await update.message.reply_text(f"🎙 Распознано: «{text}»\n\n{text_reply}", parse_mode="HTML", reply_markup=kb)
@@ -733,7 +941,13 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"🎙 Распознано: «{text}»\n\n{_build_bydate_reply(chat_id)}")
         return
     if intent == "mark_done":
-        await update.message.reply_text(f"🎙 Распознано: «{text}»\n\n{_mark_done_by_number(chat_id, parsed.get('task_number'))}")
+        reply = _mark_done_smart(
+            chat_id,
+            task_number=parsed.get("task_number"),
+            task_text=parsed.get("task"),
+            job_queue=context.job_queue,
+        )
+        await update.message.reply_text(f"🎙 Распознано: «{text}»\n\n{reply}")
         return
     if intent == "snooze":
         minutes = parsed.get("snooze_minutes") or 10
@@ -915,6 +1129,45 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
     elif action == "ev_dismiss":
         await query.edit_message_text("👌 Задачи оставлены в текущем расписании. Приятного вечера! 🌙")
 
+    elif action == "cal_d":
+        target_dt = date.fromisoformat(parts[1])
+        new_text, new_kb = _build_calendar_view(chat_id, target_dt)
+        await query.edit_message_text(new_text, parse_mode="HTML", reply_markup=new_kb)
+
+    elif action == "cal_w":
+        target_dt = date.fromisoformat(parts[1])
+        new_text, new_kb = _build_calendar_view(chat_id, target_dt)
+        await query.edit_message_text(new_text, parse_mode="HTML", reply_markup=new_kb)
+
+    elif action == "chk_cal":
+        task_id = int(parts[1])
+        target_dt = date.fromisoformat(parts[2])
+        if mark_done(chat_id, task_id):
+            for job in context.job_queue.get_jobs_by_name(f"followup_{chat_id}_{task_id}"):
+                job.schedule_removal()
+        new_text, new_kb = _build_calendar_view(chat_id, target_dt)
+        await query.edit_message_text(new_text, parse_mode="HTML", reply_markup=new_kb)
+
+
+async def calendar_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Отображает интерактивный календарь с сеткой недели и расписанием дня."""
+    chat_id = update.effective_chat.id
+    register_user(chat_id)
+    target_dt = date.today()
+    if context.args:
+        arg = context.args[0].lower()
+        if arg in ("tomorrow", "завтра"):
+            target_dt = date.today() + timedelta(days=1)
+        elif arg in ("yesterday", "вчера"):
+            target_dt = date.today() - timedelta(days=1)
+        else:
+            try:
+                target_dt = date.fromisoformat(arg)
+            except Exception:
+                pass
+    text_reply, kb = _build_calendar_view(chat_id, target_dt)
+    await update.message.reply_text(text_reply, parse_mode="HTML", reply_markup=kb)
+
 
 async def snooze_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
@@ -1036,17 +1289,22 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• «Что купить?» или /shopping ➔ интерактивный список покупок\n"
         "• /list ➔ список дел с кнопками зачеркивания в 1 клик\n\n"
         "✨ <b>Новые возможности:</b>\n"
+        "• <b>Календарь и расписание (/calendar)</b>: наглядная сетка недели с точками дел, таймлайном дня и кнопками вычеркивания\n"
+        "• <b>Диапазоны времени</b>: говорите «с 14:00 до 15:30» — бот зафиксирует временной слот и предупредит при наложениях\n"
+        "• <b>Умное выполнение</b>: говорите или пишите «купил молоко» или «отчет сдал» — номер вводить не обязательно\n"
         "• <b>Умный диктофон (AudioPen)</b>: запишите длинное голосовое с мыслями — бот очистит от слов-паразитов, выделит тезисы и добавит задачи в расписание (или команда /note)\n"
         "• <b>Live Checklist</b>: нажимайте на кнопки прямо в сообщении, чтобы вычеркивать задачи\n"
         "• <b>Категории</b>: переключайтесь между #покупки, #работа, #личное, #идеи\n"
         "• <b>Вечерний обзор (21:00)</b>: бот покажет итоги дня и предложит сдвинуть несделанное на завтра\n"
         "• <b>Контрольный переспрос</b>: если задача просрочена, бот вежливо поинтересуется, удалось ли сделать\n\n"
         "Основные команды:\n"
+        "/calendar — интерактивный календарь и расписание дня\n"
         "/list — интерактивный чек-лист дел\n"
         "/shopping — список покупок\n"
         "/note <мысли> — структурировать длинную заметку/встречу\n"
         "/today — задачи на сегодня\n"
         "/bydate — дела по датам\n"
+        "/done <номер или название> — отметить выполненной\n"
         "/recurring — регулярные привычки\n"
         "/search <запрос> — быстрый поиск\n"
         "/history <вопрос> — умный поиск по выполненным делам\n"
@@ -1075,6 +1333,7 @@ def main():
     app.add_error_handler(on_error)
 
     app.add_handler(CommandHandler("start", start_cmd))
+    app.add_handler(CommandHandler(["calendar", "cal", "schedule"], calendar_cmd))
     app.add_handler(CommandHandler("list", list_tasks_cmd))
     app.add_handler(CommandHandler("shopping", shopping_cmd))
     app.add_handler(CommandHandler("buy", shopping_cmd))

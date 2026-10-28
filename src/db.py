@@ -32,7 +32,8 @@ def init_db():
             recurring_time TEXT,
             exclude_days TEXT,
             completed_at TEXT,
-            category TEXT NOT NULL DEFAULT 'general'
+            category TEXT NOT NULL DEFAULT 'general',
+            end_time TEXT
         )
     """)
     conn.execute("""
@@ -64,6 +65,8 @@ def init_db():
         conn.execute("ALTER TABLE tasks ADD COLUMN snooze_count INTEGER NOT NULL DEFAULT 0")
     if "category" not in existing_columns:
         conn.execute("ALTER TABLE tasks ADD COLUMN category TEXT NOT NULL DEFAULT 'general'")
+    if "end_time" not in existing_columns:
+        conn.execute("ALTER TABLE tasks ADD COLUMN end_time TEXT")
 
     conn.commit()
     conn.close()
@@ -89,13 +92,19 @@ def list_all_chat_ids() -> list[int]:
 
 
 def add_task(
-    chat_id: int, text: str, due_time: str | None = None, priority: str = "normal", snooze_count: int = 0, category: str = "general"
+    chat_id: int,
+    text: str,
+    due_time: str | None = None,
+    priority: str = "normal",
+    snooze_count: int = 0,
+    category: str = "general",
+    end_time: str | None = None,
 ) -> int:
     conn = sqlite3.connect(DB_PATH)
     cur = conn.execute(
-        """INSERT INTO tasks (chat_id, text, due_time, status, created_at, priority, snooze_count, category)
-           VALUES (?, ?, ?, 'pending', ?, ?, ?, ?)""",
-        (chat_id, text, due_time, datetime.now().isoformat(), priority, snooze_count, category),
+        """INSERT INTO tasks (chat_id, text, due_time, end_time, status, created_at, priority, snooze_count, category)
+           VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?)""",
+        (chat_id, text, due_time, end_time, datetime.now().isoformat(), priority, snooze_count, category),
     )
     conn.commit()
     task_id = cur.lastrowid
@@ -109,14 +118,14 @@ def list_pending_tasks(chat_id: int, category: str | None = None) -> list[dict]:
     conn.row_factory = sqlite3.Row
     if category:
         rows = conn.execute(
-            """SELECT id, text, due_time, priority, snooze_count, status, category FROM tasks
+            """SELECT id, text, due_time, end_time, priority, snooze_count, status, category FROM tasks
                WHERE chat_id = ? AND status IN ('pending', 'reminded') AND is_recurring = 0 AND category = ?
                ORDER BY CASE WHEN priority = 'high' THEN 0 ELSE 1 END, id""",
             (chat_id, category),
         ).fetchall()
     else:
         rows = conn.execute(
-            """SELECT id, text, due_time, priority, snooze_count, status, category FROM tasks
+            """SELECT id, text, due_time, end_time, priority, snooze_count, status, category FROM tasks
                WHERE chat_id = ? AND status IN ('pending', 'reminded') AND is_recurring = 0
                ORDER BY CASE WHEN priority = 'high' THEN 0 ELSE 1 END, id""",
             (chat_id,),
@@ -381,3 +390,122 @@ def get_task_history(chat_id: int, limit: int = 200) -> list[dict]:
     ).fetchall()
     conn.close()
     return [dict(row) for row in rows]
+
+
+def get_tasks_for_date(chat_id: int, date_str: str) -> list[dict]:
+    """Возвращает активные задачи на указанную дату (YYYY-MM-DD), отсортированные по времени."""
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute(
+        """SELECT id, text, due_time, end_time, priority, snooze_count, status, category FROM tasks
+           WHERE chat_id = ? AND status IN ('pending', 'reminded') AND is_recurring = 0
+           AND (due_time LIKE ? OR (due_time IS NULL AND date(created_at) = ?))
+           ORDER BY CASE WHEN due_time IS NULL THEN 1 ELSE 0 END, due_time ASC, id ASC""",
+        (chat_id, f"{date_str}%", date_str),
+    ).fetchall()
+    conn.close()
+    return [dict(row) for row in rows]
+
+
+def get_task_dates_in_range(chat_id: int, start_date: str, end_date: str) -> set[str]:
+    """Возвращает даты (YYYY-MM-DD), на которые запланированы задачи в диапазоне [start_date, end_date]."""
+    conn = sqlite3.connect(DB_PATH)
+    rows = conn.execute(
+        """SELECT DISTINCT substr(due_time, 1, 10) FROM tasks
+           WHERE chat_id = ? AND status IN ('pending', 'reminded') AND is_recurring = 0
+           AND due_time IS NOT NULL AND substr(due_time, 1, 10) BETWEEN ? AND ?""",
+        (chat_id, start_date, end_date),
+    ).fetchall()
+    conn.close()
+    return {row[0] for row in rows if row[0]}
+
+
+def check_time_conflict(
+    chat_id: int, start_time_str: str, end_time_str: str | None = None, exclude_id: int | None = None
+) -> list[dict]:
+    """Проверяет, пересекается ли интервал задачи с уже существующими запланированными задачами."""
+    from datetime import datetime, timedelta
+
+    if not start_time_str or " " not in start_time_str:
+        return []
+
+    try:
+        new_start = datetime.strptime(start_time_str, "%Y-%m-%d %H:%M")
+    except ValueError:
+        return []
+
+    if end_time_str:
+        try:
+            new_end = datetime.strptime(end_time_str, "%Y-%m-%d %H:%M")
+        except ValueError:
+            new_end = new_start + timedelta(minutes=30)
+    else:
+        new_end = new_start + timedelta(minutes=30)
+
+    date_str = start_time_str.split(" ")[0]
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute(
+        """SELECT id, text, due_time, end_time, category FROM tasks
+           WHERE chat_id = ? AND status IN ('pending', 'reminded') AND is_recurring = 0
+           AND due_time LIKE ?""",
+        (chat_id, f"{date_str}%"),
+    ).fetchall()
+    conn.close()
+
+    conflicts = []
+    for row in rows:
+        t = dict(row)
+        if exclude_id and t["id"] == exclude_id:
+            continue
+        try:
+            ex_start = datetime.strptime(t["due_time"], "%Y-%m-%d %H:%M")
+            if t.get("end_time"):
+                ex_end = datetime.strptime(t["end_time"], "%Y-%m-%d %H:%M")
+            else:
+                ex_end = ex_start + timedelta(minutes=30)
+
+            # Пересечение: max(A_start, B_start) < min(A_end, B_end)
+            if max(new_start, ex_start) < min(new_end, ex_end):
+                conflicts.append(t)
+        except Exception:
+            continue
+
+    return conflicts
+
+
+def find_task_by_text(chat_id: int, query: str) -> dict | None:
+    """Умный нечеткий поиск активной задачи по фрагменту текста или ключевым словам."""
+    if not query:
+        return None
+    tasks = list_pending_tasks(chat_id)
+    if not tasks:
+        return None
+
+    clean_query = query.lower().strip()
+    # 1. Прямое точное или частичное совпадение
+    for t in tasks:
+        t_text = t["text"].lower()
+        if clean_query in t_text or t_text in clean_query:
+            return t
+
+    # 2. Поиск по ключевым словам (без стоп-слов)
+    stop_words = {
+        "я", "мы", "сделал", "сделано", "выполнил", "выполнено", "закрыл", "закрыть",
+        "купил", "купила", "купили", "завершил", "завершено", "было", "задачу", "дело",
+        "отметь", "отметить", "готово", "пожалуйста",
+    }
+    query_words = set(clean_query.split()) - stop_words
+    if not query_words:
+        return None
+
+    best_match = None
+    best_score = 0
+    for t in tasks:
+        t_words = set(t["text"].lower().split())
+        overlap = len(query_words & t_words)
+        if overlap > best_score:
+            best_score = overlap
+            best_match = t
+
+    return best_match if best_score > 0 else None
