@@ -75,15 +75,17 @@ SYSTEM_PROMPT = """Ты анализируешь входящее сообщен
 Текущие дата и время: {now}
 
 Ответь ТОЛЬКО валидным JSON, без какого-либо дополнительного текста, без markdown-разметки (без ```json), строго в следующем формате:
-{{"intent": "add_task" | "show_today" | "show_list" | "show_bydate" |
+{{"intent": "add_task" | "show_today" | "show_list" | "show_bydate" | "show_shopping" |
   "mark_done" | "snooze" | "show_recurring" | "stop_recurring" | "show_insights" |
   "search_task" | "search_history",
   "task": "краткое описание задачи или заметки", "due_time": "YYYY-MM-DD HH:MM" или null,
+  "category": "work" | "personal" | "shopping" | "ideas" | "general",
   "recurring": true или false, "recurring_time": "HH:MM" или null, "exclude_days": [],
   "priority": "high" или "normal", "task_number": integer или null,
   "snooze_minutes": integer или null, "search_query": "поисковый запрос" или null}}
 
 Правила определения намерения (intent) — определи в ПЕРВУЮ очередь:
+- "show_shopping": запрос списка покупок (например: "что купить", "список покупок", "покажи покупки", "продукты", "что надо купить").
 - "show_today": запрос на просмотр задач на сегодня (например: "что у меня на сегодня", "покажи дела на сегодня", "планы на день", "сегодняшние задачи").
 - "show_list": запрос на просмотр ВСЕХ активных задач и заметок (например: "покажи все задачи", "список дел", "все заметки", "что у меня запланировано").
 - "show_bydate": запрос на просмотр задач, сгруппированных по датам (например: "покажи задачи по датам", "дела по дням", "расписание по числам").
@@ -101,6 +103,14 @@ SYSTEM_PROMPT = """Ты анализируешь входящее сообщен
   Это вопрос о том, что уже выполнено или сработало ранее. Извлеки суть вопроса в search_query.
 - "add_task": ВСЁ ОСТАЛЬНОЕ — любое добавление новой задачи, напоминания или заметки (например: "купить молоко", "напомни сдать отчет завтра в 18:00").
   Даже если упоминается "сегодня" (например: "напомни отправить письмо сегодня в 20:00"), это add_task, а не show_today, так как создается действие.
+
+Правила для категории (category):
+- "shopping": любые покупки, продукты, еда, бытовые товары, одежда, заказ товаров (например: "купить хлеб и молоко", "заказать корм коту", "купить лампочки").
+- "work": задачи по работе, бизнесу, клиентам, проектам, отчетам, звонкам, коду.
+- "ideas": идеи, мысли, заметки на будущее, почитать книгу, посмотреть фильм.
+- "personal": здоровье, семья, дом, личные дела, тренировки, врачи.
+- "general": если трудно отнести к конкретной категории.
+Если в сообщении прямо указан хештег (#покупки, #работа, #идеи, #личное), строго используй соответствующую категорию.
 
 Для намерений, отличных от "add_task", оставляй неиспользуемые поля по умолчанию (null, false, []).
 
@@ -128,6 +138,7 @@ def parse_task(message: str) -> dict:
         "intent": "add_task",
         "task": message,
         "due_time": None,
+        "category": "general",
         "recurring": False,
         "recurring_time": None,
         "exclude_days": [],
@@ -153,6 +164,7 @@ def parse_task(message: str) -> dict:
         if isinstance(parsed, dict):
             parsed.setdefault("intent", "add_task")
             parsed.setdefault("task", message)
+            parsed.setdefault("category", "general")
             parsed.setdefault("recurring", False)
             parsed.setdefault("recurring_time", None)
             parsed.setdefault("exclude_days", [])

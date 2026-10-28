@@ -2,8 +2,14 @@
 Основной модуль Telegram-бота.
 Использует long polling (не требует webhook, белого IP или ngrok)
 и JobQueue для надежной отправки запланированных напоминаний.
-Поддерживает интерактивные кнопки, автопроверку выполнения (follow-up)
-и учет просроченных задач.
+
+Включает:
+- Интерактивный Live Checklist (зачеркивание в 1 клик прямо в сообщении)
+- Автоматические категории и фильтры (#покупки, #работа, #личное, #идеи)
+- Отдельный режим списка покупок (/shopping, /buy)
+- Вечерний обзор и рефлексию (Evening Wind-Down в 21:00)
+- Контрольный переспрос невыполненных задач (Follow-up)
+- Подсветку просроченных дел (⚠️ просрочено)
 """
 import os
 import tempfile
@@ -25,6 +31,7 @@ from src.db import (
     add_recurring_task, list_recurring_tasks, delete_task, get_weekly_stats,
     log_recurring_fired, mark_recurring_done, get_recurring_weekly_stats,
     get_task_history, get_task_by_id, mark_task_reminded, update_task_due_time,
+    get_tasks_completed_today, reschedule_overdue_tasks_to_tomorrow,
 )
 from src.llm_parser import parse_task, transcribe_voice, generate_weekly_insight, generate_history_answer
 from src.semantic_search import semantic_search
@@ -32,8 +39,25 @@ from src.semantic_search import semantic_search
 WEEKDAY_NUMBERS = {"mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6}
 RU_WEEKDAYS = {"mon": "пн", "tue": "вт", "wed": "ср", "thu": "чт", "fri": "пт", "sat": "сб", "sun": "вс"}
 
+RU_CATEGORIES = {
+    "all": "📋 Все",
+    "shopping": "🛒 Покупки",
+    "work": "💼 Работа",
+    "personal": "🏠 Личное",
+    "ideas": "💡 Идеи",
+}
+
+RU_CATEGORY_TAGS = {
+    "work": " <i>#работа</i>",
+    "personal": " <i>#личное</i>",
+    "shopping": " <i>#покупки</i>",
+    "ideas": " <i>#идеи</i>",
+    "general": "",
+}
+
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 REMINDER_TIME = os.environ.get("REMINDER_TIME", "08:00")
+EVENING_TIME = os.environ.get("EVENING_TIME", "21:00")
 TIMEZONE_NAME = os.environ.get("TIMEZONE", "Europe/Moscow")
 try:
     BOT_TZ = ZoneInfo(TIMEZONE_NAME)
@@ -94,9 +118,7 @@ def get_recurring_keyboard(task_id: int) -> InlineKeyboardMarkup:
 
 
 async def send_task_reminder(context: ContextTypes.DEFAULT_TYPE):
-    """Срабатывание разового напоминания.
-    Задача помечается как 'reminded' (остается в списке активных до закрытия),
-    отправляются кнопки и планируется контрольный переспрос."""
+    """Срабатывание разового напоминания."""
     chat_id = context.job.chat_id
     task_id, text, snooze_count = context.job.data
     mark_task_reminded(chat_id, task_id)
@@ -209,17 +231,47 @@ def _format_task_due(t: dict) -> str:
     return f" (⏰ {t['due_time']})"
 
 
-def _build_list_reply(chat_id: int) -> str:
-    tasks = list_pending_tasks(chat_id)
-    if not tasks:
-        return "У вас нет активных задач и заметок."
+def _build_checklist(chat_id: int, category: str = "all") -> tuple[str, InlineKeyboardMarkup]:
+    """Строит интерактивный чек-лист дел с кнопками зачеркивания и фильтрами по категориям."""
+    cat_filter = None if category in (None, "all", "") else category
+    tasks = list_pending_tasks(chat_id, category=cat_filter)
+    cat_name = RU_CATEGORIES.get(category, "📋 Все задачи")
+
     _last_list_mapping[chat_id] = {i + 1: t["id"] for i, t in enumerate(tasks)}
-    lines = ["📋 Ваши активные задачи и заметки:"]
+
+    filter_row = [
+        InlineKeyboardButton("• Все •" if category == "all" else "📋 Все", callback_data="flt:all"),
+        InlineKeyboardButton("• Покупки •" if category == "shopping" else "🛒 Покупки", callback_data="flt:shopping"),
+        InlineKeyboardButton("• Работа •" if category == "work" else "💼 Работа", callback_data="flt:work"),
+        InlineKeyboardButton("• Идеи •" if category == "ideas" else "💡 Идеи", callback_data="flt:ideas"),
+    ]
+
+    if not tasks:
+        text = f"<b>{cat_name}:</b>\n<i>Нет активных задач в этом списке.</i>"
+        keyboard = InlineKeyboardMarkup([filter_row])
+        return text, keyboard
+
+    lines = [f"<b>{cat_name}</b> ({len(tasks)}):"]
     for i, t in enumerate(tasks):
         mark = "🔴 " if t["priority"] == "high" else ""
-        lines.append(f"{i + 1}. {mark}{t['text']}{_format_task_due(t)}")
-    lines.append("\nЧтобы отметить выполненной: /done <номер>")
-    return "\n".join(lines)
+        tag = RU_CATEGORY_TAGS.get(t.get("category"), "")
+        lines.append(f"{i + 1}. {mark}{t['text']}{_format_task_due(t)}{tag}")
+
+    lines.append("\n<i>Нажмите кнопку ниже, чтобы отметить выполненной:</i>")
+
+    # Кнопки для завершения задач (по 4 в ряд)
+    check_buttons = []
+    current_row = []
+    for i, t in enumerate(tasks[:16]):  # до 16 задач в кнопках
+        current_row.append(InlineKeyboardButton(f"{i + 1}. ✅", callback_data=f"chk:{t['id']}:{category}"))
+        if len(current_row) == 4:
+            check_buttons.append(current_row)
+            current_row = []
+    if current_row:
+        check_buttons.append(current_row)
+
+    check_buttons.append(filter_row)
+    return "\n".join(lines), InlineKeyboardMarkup(check_buttons)
 
 
 def _build_today_reply(chat_id: int) -> str:
@@ -230,13 +282,13 @@ def _build_today_reply(chat_id: int) -> str:
     todays_tasks = [
         t for t in tasks
         if (t["due_time"] and t["due_time"].startswith(today_str))
-        or (t.get("status") == "reminded")  # включаем сработавшие сегодня
+        or (t.get("status") == "reminded")
     ]
     if not todays_tasks:
         return "На сегодня нет запланированных задач."
 
     _last_list_mapping[chat_id] = {i + 1: t["id"] for i, t in enumerate(todays_tasks)}
-    lines = ["📅 Задачи на сегодня:"]
+    lines = ["📅 <b>Задачи на сегодня:</b>"]
     for i, t in enumerate(todays_tasks):
         mark = "🔴 " if t["priority"] == "high" else ""
         time_part = t["due_time"].split(" ")[1] if t.get("due_time") and " " in t["due_time"] else ""
@@ -247,7 +299,8 @@ def _build_today_reply(chat_id: int) -> str:
         else:
             suffix = f" (в {time_part})" if time_part else ""
 
-        lines.append(f"{i + 1}. {mark}{t['text']}{suffix}")
+        tag = RU_CATEGORY_TAGS.get(t.get("category"), "")
+        lines.append(f"{i + 1}. {mark}{t['text']}{suffix}{tag}")
     lines.append("\nЧтобы отметить выполненной: /done <номер>")
     return "\n".join(lines)
 
@@ -300,7 +353,15 @@ async def search_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def list_tasks_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     register_user(chat_id)
-    await update.message.reply_text(_build_list_reply(chat_id))
+    text_reply, kb = _build_checklist(chat_id, category="all")
+    await update.message.reply_text(text_reply, parse_mode="HTML", reply_markup=kb)
+
+
+async def shopping_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    register_user(chat_id)
+    text_reply, kb = _build_checklist(chat_id, category="shopping")
+    await update.message.reply_text(text_reply, parse_mode="HTML", reply_markup=kb)
 
 
 def _build_bydate_reply(chat_id: int) -> str:
@@ -320,7 +381,8 @@ def _build_bydate_reply(chat_id: int) -> str:
         for t in grouped[date_str]:
             mapping[counter] = t["id"]
             mark = "🔴 " if t["priority"] == "high" else ""
-            lines.append(f"  {counter}. {mark}{t['text']}{_format_task_due(t)}")
+            tag = RU_CATEGORY_TAGS.get(t.get("category"), "")
+            lines.append(f"  {counter}. {mark}{t['text']}{_format_task_due(t)}{tag}")
             counter += 1
         blocks.append("\n".join(lines))
 
@@ -338,7 +400,7 @@ async def bydate_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def today_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     register_user(chat_id)
-    await update.message.reply_text(_build_today_reply(chat_id))
+    await update.message.reply_text(_build_today_reply(chat_id), parse_mode="HTML")
 
 
 async def done_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -425,11 +487,13 @@ async def _process_parsed_task(chat_id: int, parsed: dict, job_queue) -> str:
         return f"Регулярное напоминание создано: {parsed['task']} — ежедневно в {parsed['recurring_time']}{skip}"
 
     priority = parsed.get("priority", "normal")
-    task_id = add_task(chat_id, parsed["task"], parsed.get("due_time"), priority, snooze_count=0)
+    category = parsed.get("category", "general")
+    task_id = add_task(chat_id, parsed["task"], parsed.get("due_time"), priority, snooze_count=0, category=category)
     schedule_task_reminder(job_queue, chat_id, task_id, parsed["task"], parsed.get("due_time"), snooze_count=0)
     due = f" (⏰ срок: {parsed['due_time']})" if parsed.get("due_time") else " (📝 заметка)"
     mark = "🔴 " if priority == "high" else ""
-    return f"Добавлено [#{task_id}]: {mark}{parsed['task']}{due}"
+    tag = RU_CATEGORY_TAGS.get(category, "")
+    return f"Добавлено [#{task_id}]: {mark}{parsed['task']}{due}{tag}"
 
 
 def _mark_done_by_number(chat_id: int, task_number: int | None) -> str:
@@ -458,11 +522,16 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     intent = parsed.get("intent")
 
+    if intent == "show_shopping":
+        text_reply, kb = _build_checklist(chat_id, category="shopping")
+        await update.message.reply_text(text_reply, parse_mode="HTML", reply_markup=kb)
+        return
     if intent == "show_today":
-        await update.message.reply_text(_build_today_reply(chat_id))
+        await update.message.reply_text(_build_today_reply(chat_id), parse_mode="HTML")
         return
     if intent == "show_list":
-        await update.message.reply_text(_build_list_reply(chat_id))
+        text_reply, kb = _build_checklist(chat_id, category="all")
+        await update.message.reply_text(text_reply, parse_mode="HTML", reply_markup=kb)
         return
     if intent == "show_bydate":
         await update.message.reply_text(_build_bydate_reply(chat_id))
@@ -494,7 +563,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     reply = await _process_parsed_task(chat_id, parsed, context.job_queue)
-    await update.message.reply_text(reply)
+    await update.message.reply_text(reply, parse_mode="HTML")
 
 
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -516,11 +585,16 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     parsed = parse_task(text)
     intent = parsed.get("intent")
 
+    if intent == "show_shopping":
+        text_reply, kb = _build_checklist(chat_id, category="shopping")
+        await update.message.reply_text(f"🎙 Распознано: «{text}»\n\n{text_reply}", parse_mode="HTML", reply_markup=kb)
+        return
     if intent == "show_today":
-        await update.message.reply_text(f"🎙 Распознано: «{text}»\n\n{_build_today_reply(chat_id)}")
+        await update.message.reply_text(f"🎙 Распознано: «{text}»\n\n{_build_today_reply(chat_id)}", parse_mode="HTML")
         return
     if intent == "show_list":
-        await update.message.reply_text(f"🎙 Распознано: «{text}»\n\n{_build_list_reply(chat_id)}")
+        text_reply, kb = _build_checklist(chat_id, category="all")
+        await update.message.reply_text(f"🎙 Распознано: «{text}»\n\n{text_reply}", parse_mode="HTML", reply_markup=kb)
         return
     if intent == "show_bydate":
         await update.message.reply_text(f"🎙 Распознано: «{text}»\n\n{_build_bydate_reply(chat_id)}")
@@ -551,7 +625,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     reply = await _process_parsed_task(chat_id, parsed, context.job_queue)
-    await update.message.reply_text(f"🎙 Распознано: «{text}»\n\n{reply}")
+    await update.message.reply_text(f"🎙 Распознано: «{text}»\n\n{reply}", parse_mode="HTML")
 
 
 async def _snooze_last_fired(chat_id: int, minutes: int, job_queue) -> list[str]:
@@ -593,7 +667,7 @@ async def _snooze_last_fired(chat_id: int, minutes: int, job_queue) -> list[str]
 
 
 async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработка нажатий на инлайн-кнопки под напоминаниями."""
+    """Обработка нажатий на инлайн-кнопки под напоминаниями, в списках и вечернем обзоре."""
     query = update.callback_query
     await query.answer()
 
@@ -612,6 +686,23 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             await query.edit_message_text(f"✅ Выполнено: «{task_text}»\nОтличная работа!")
         else:
             await query.edit_message_text("Задача уже отмечена выполненной.")
+
+    elif action == "chk":
+        task_id = int(parts[1])
+        current_cat = parts[2]
+        task = get_task_by_id(chat_id, task_id)
+        if mark_done(chat_id, task_id):
+            for job in context.job_queue.get_jobs_by_name(f"followup_{chat_id}_{task_id}"):
+                job.schedule_removal()
+
+        # Обновляем список прямо в сообщении
+        new_text, new_kb = _build_checklist(chat_id, category=current_cat)
+        await query.edit_message_text(new_text, parse_mode="HTML", reply_markup=new_kb)
+
+    elif action == "flt":
+        target_cat = parts[1]
+        new_text, new_kb = _build_checklist(chat_id, category=target_cat)
+        await query.edit_message_text(new_text, parse_mode="HTML", reply_markup=new_kb)
 
     elif action == "snooze":
         task_id = int(parts[1])
@@ -680,6 +771,17 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         )
         await query.edit_message_text(f"⏰ Напомню о привычке «{text}» через {mins} мин.")
 
+    elif action == "ev_tomorrow":
+        tomorrow_09 = (datetime.now(BOT_TZ) + timedelta(days=1)).strftime("%Y-%m-%d 09:00")
+        count = reschedule_overdue_tasks_to_tomorrow(chat_id, tomorrow_09)
+        await query.edit_message_text(
+            f"✨ Незавершенные задачи ({count} шт.) успешно перенесены на завтра в 09:00!\n"
+            f"Хорошего вечера и приятного отдыха 🌙"
+        )
+
+    elif action == "ev_dismiss":
+        await query.edit_message_text("👌 Задачи оставлены в текущем расписании. Приятного вечера! 🌙")
+
 
 async def snooze_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
@@ -722,39 +824,99 @@ async def send_daily_reminder(context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_message(chat_id, "Сегодня нет незавершенных дел. Отличного дня! ✨")
             continue
 
-        lines = ["☀️ Ваши активные дела и заметки:"]
+        lines = ["☀️ <b>Ваши активные дела и заметки:</b>"]
         for i, t in enumerate(tasks):
-            lines.append(f"{i + 1}. {t['text']}{_format_task_due(t)}")
-        lines.append("\nЧтобы отметить задачу выполненной, используй /done <номер>.")
+            tag = RU_CATEGORY_TAGS.get(t.get("category"), "")
+            lines.append(f"{i + 1}. {t['text']}{_format_task_due(t)}{tag}")
+        lines.append("\nЧтобы открыть интерактивный список с кнопками: /list")
 
         _last_list_mapping[chat_id] = {i + 1: t["id"] for i, t in enumerate(tasks)}
-        await context.bot.send_message(chat_id, "\n".join(lines))
+        await context.bot.send_message(chat_id, "\n".join(lines), parse_mode="HTML")
+
+
+async def send_evening_review(context: ContextTypes.DEFAULT_TYPE):
+    """Вечерний обзор дня в 21:00: итоги и предложение перенести несделанное на завтра."""
+    for chat_id in list_all_chat_ids():
+        done_today = get_tasks_completed_today(chat_id)
+        pending = list_pending_tasks(chat_id)
+        today_str = date.today().isoformat()
+        now_dt = datetime.now(BOT_TZ)
+
+        # Невыполненные задачи, назначенные на сегодня или просроченные
+        overdue_or_today = [
+            t for t in pending
+            if t.get("due_time") and (
+                t["due_time"].startswith(today_str) or (_parse_due_datetime(t["due_time"]) and _parse_due_datetime(t["due_time"]) < now_dt)
+            )
+        ]
+
+        if not overdue_or_today and done_today == 0:
+            continue
+
+        if not overdue_or_today and done_today > 0:
+            await context.bot.send_message(
+                chat_id,
+                f"🌙 <b>Добрый вечер!</b>\n"
+                f"Сегодня ты отлично поработал и закрыл <b>{done_today}</b> задач(и) 🎉\n"
+                f"Все запланированные дела выполнены. Спокойного отдыха!",
+                parse_mode="HTML",
+            )
+            continue
+
+        lines = [
+            f"🌙 <b>Вечерний обзор дня:</b>",
+            f"✅ Выполнено сегодня: <b>{done_today}</b>",
+            f"⏳ Остались незавершенными ({len(overdue_or_today)}):",
+        ]
+        for i, t in enumerate(overdue_or_today[:5]):
+            lines.append(f"• {t['text']}")
+        if len(overdue_or_today) > 5:
+            lines.append(f"<i>...и еще {len(overdue_or_today) - 5} задач</i>")
+
+        lines.append("\nПеренести незавершенные дела на завтра?")
+
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("📅 Перенести всё на завтра 09:00", callback_data="ev_tomorrow"),
+            ],
+            [
+                InlineKeyboardButton("👌 Оставить как есть", callback_data="ev_dismiss"),
+            ]
+        ])
+
+        await context.bot.send_message(
+            chat_id,
+            "\n".join(lines),
+            parse_mode="HTML",
+            reply_markup=keyboard,
+        )
 
 
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     register_user(update.effective_chat.id)
     await update.message.reply_text(
-        "👋 Привет! Я твой персональный AI-помощник для заметок и напоминаний.\n\n"
+        "👋 Привет! Я твой персональный AI-помощник для заметок, покупок и напоминаний.\n\n"
         "Ты можешь отправлять мне текст или голосовые сообщения:\n"
-        "• «Купить кофе и молоко» — запишется как заметка\n"
-        "• «Напомни позвонить врачу завтра в 15:30» — разовое напоминание\n"
-        "• «Напоминай каждый день в 09:00 пить воду кроме воскресенья» — регулярная привычка\n"
-        "• «Что у меня на сегодня?» или «Покажи список дел»\n"
-        "• «Что я делал на прошлой неделе по налогам?» — умный поиск в истории дел\n\n"
-        "💡 В напоминаниях доступны удобные кнопки в 1 клик:\n"
-        "[✅ Выполнено], [⏰ +15 мин], [⏰ +1 час], [📅 На завтра].\n"
-        "Если задача не выполнена, бот пришлет контрольный переспрос!\n\n"
+        "• «Купить молоко, сыр и хлеб» ➔ добавит в #покупки\n"
+        "• «Сдать отчет в пятницу в 18:00» ➔ напомнит вовремя (#работа)\n"
+        "• «Напоминай каждый день в 09:00 пить воду кроме воскресенья» ➔ привычка\n"
+        "• «Что купить?» или /shopping ➔ интерактивный список покупок\n"
+        "• /list ➔ список дел с кнопками зачеркивания в 1 клик\n\n"
+        "✨ <b>Новые возможности:</b>\n"
+        "• <b>Live Checklist</b>: нажимайте на кнопки прямо в сообщении, чтобы вычеркивать задачи\n"
+        "• <b>Категории</b>: переключайтесь между #покупки, #работа, #личное, #идеи\n"
+        "• <b>Вечерний обзор (21:00)</b>: бот покажет итоги дня и предложит сдвинуть несделанное на завтра\n"
+        "• <b>Контрольный переспрос</b>: если задача просрочена, бот вежливо поинтересуется, удалось ли сделать\n\n"
         "Основные команды:\n"
-        "/list — все задачи и заметки\n"
-        "/today — дела на сегодня\n"
-        "/bydate — группировка по датам\n"
-        "/done <номер> — отметить выполненной\n"
-        "/recurring — регулярные напоминания\n"
-        "/stoprecurring <номер> — отключить регулярное напоминание\n"
-        "/snooze <минуты> — отложить последнее напоминание\n"
-        "/search <запрос> — быстрый поиск среди дел\n"
-        "/history <вопрос> — поиск в истории выполненных задач\n"
-        "/insights — сводка продуктивности"
+        "/list — интерактивный чек-лист дел\n"
+        "/shopping — список покупок\n"
+        "/today — задачи на сегодня\n"
+        "/bydate — дела по датам\n"
+        "/recurring — регулярные привычки\n"
+        "/search <запрос> — быстрый поиск\n"
+        "/history <вопрос> — умный поиск по выполненным делам\n"
+        "/insights — сводка продуктивности",
+        parse_mode="HTML"
     )
 
 
@@ -779,6 +941,8 @@ def main():
 
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("list", list_tasks_cmd))
+    app.add_handler(CommandHandler("shopping", shopping_cmd))
+    app.add_handler(CommandHandler("buy", shopping_cmd))
     app.add_handler(CommandHandler("bydate", bydate_cmd))
     app.add_handler(CommandHandler("today", today_cmd))
     app.add_handler(CommandHandler("done", done_cmd))
@@ -792,8 +956,15 @@ def main():
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
+    # Утренний дайджест в 08:00
     hour, minute = map(int, REMINDER_TIME.split(":"))
     app.job_queue.run_daily(send_daily_reminder, time=dtime(hour=hour, minute=minute, tzinfo=BOT_TZ))
+
+    # Вечерний обзор дня в 21:00
+    ehour, eminute = map(int, EVENING_TIME.split(":"))
+    app.job_queue.run_daily(send_evening_review, time=dtime(hour=ehour, minute=eminute, tzinfo=BOT_TZ))
+
+    # Еженедельный отчет в воскресенье
     app.job_queue.run_daily(
         send_weekly_insight, time=dtime(hour=hour, minute=minute, tzinfo=BOT_TZ), days=(6,)
     )

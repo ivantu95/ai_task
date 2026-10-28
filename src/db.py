@@ -31,7 +31,8 @@ def init_db():
             is_recurring INTEGER NOT NULL DEFAULT 0,
             recurring_time TEXT,
             exclude_days TEXT,
-            completed_at TEXT
+            completed_at TEXT,
+            category TEXT NOT NULL DEFAULT 'general'
         )
     """)
     conn.execute("""
@@ -61,6 +62,8 @@ def init_db():
         conn.execute("ALTER TABLE tasks ADD COLUMN completed_at TEXT")
     if "snooze_count" not in existing_columns:
         conn.execute("ALTER TABLE tasks ADD COLUMN snooze_count INTEGER NOT NULL DEFAULT 0")
+    if "category" not in existing_columns:
+        conn.execute("ALTER TABLE tasks ADD COLUMN category TEXT NOT NULL DEFAULT 'general'")
 
     conn.commit()
     conn.close()
@@ -86,13 +89,13 @@ def list_all_chat_ids() -> list[int]:
 
 
 def add_task(
-    chat_id: int, text: str, due_time: str | None = None, priority: str = "normal", snooze_count: int = 0
+    chat_id: int, text: str, due_time: str | None = None, priority: str = "normal", snooze_count: int = 0, category: str = "general"
 ) -> int:
     conn = sqlite3.connect(DB_PATH)
     cur = conn.execute(
-        """INSERT INTO tasks (chat_id, text, due_time, status, created_at, priority, snooze_count)
-           VALUES (?, ?, ?, 'pending', ?, ?, ?)""",
-        (chat_id, text, due_time, datetime.now().isoformat(), priority, snooze_count),
+        """INSERT INTO tasks (chat_id, text, due_time, status, created_at, priority, snooze_count, category)
+           VALUES (?, ?, ?, 'pending', ?, ?, ?, ?)""",
+        (chat_id, text, due_time, datetime.now().isoformat(), priority, snooze_count, category),
     )
     conn.commit()
     task_id = cur.lastrowid
@@ -100,19 +103,54 @@ def add_task(
     return task_id
 
 
-def list_pending_tasks(chat_id: int) -> list[dict]:
-    """Возвращает активные разовые задачи (включая те, по которым уже звонило напоминание,
-    но они еще не выполнены). Задачи с высоким приоритетом идут первыми."""
+def list_pending_tasks(chat_id: int, category: str | None = None) -> list[dict]:
+    """Возвращает активные разовые задачи (включая reminded), опционально фильтруя по категории."""
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
-    rows = conn.execute(
-        """SELECT id, text, due_time, priority, snooze_count, status FROM tasks
-           WHERE chat_id = ? AND status IN ('pending', 'reminded') AND is_recurring = 0
-           ORDER BY CASE WHEN priority = 'high' THEN 0 ELSE 1 END, id""",
-        (chat_id,),
-    ).fetchall()
+    if category:
+        rows = conn.execute(
+            """SELECT id, text, due_time, priority, snooze_count, status, category FROM tasks
+               WHERE chat_id = ? AND status IN ('pending', 'reminded') AND is_recurring = 0 AND category = ?
+               ORDER BY CASE WHEN priority = 'high' THEN 0 ELSE 1 END, id""",
+            (chat_id, category),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            """SELECT id, text, due_time, priority, snooze_count, status, category FROM tasks
+               WHERE chat_id = ? AND status IN ('pending', 'reminded') AND is_recurring = 0
+               ORDER BY CASE WHEN priority = 'high' THEN 0 ELSE 1 END, id""",
+            (chat_id,),
+        ).fetchall()
     conn.close()
     return [dict(row) for row in rows]
+
+
+def get_tasks_completed_today(chat_id: int) -> int:
+    """Количество задач, закрытых сегодня (для вечерней рефлексии)."""
+    conn = sqlite3.connect(DB_PATH)
+    today_start = date.today().isoformat()
+    row = conn.execute(
+        "SELECT COUNT(*) FROM tasks WHERE chat_id = ? AND status = 'done' AND completed_at >= ?",
+        (chat_id, today_start),
+    ).fetchone()
+    conn.close()
+    return row[0] if row else 0
+
+
+def reschedule_overdue_tasks_to_tomorrow(chat_id: int, new_due_time: str) -> int:
+    """Переносит все просроченные и сегодняшние невыполненные задачи на завтра."""
+    conn = sqlite3.connect(DB_PATH)
+    now_iso = date.today().isoformat()
+    cur = conn.execute(
+        """UPDATE tasks SET due_time = ?, status = 'pending'
+           WHERE chat_id = ? AND status IN ('pending', 'reminded') AND is_recurring = 0
+           AND (due_time IS NOT NULL AND due_time <= ?)""",
+        (new_due_time, chat_id, now_iso + " 23:59"),
+    )
+    conn.commit()
+    count = cur.rowcount
+    conn.close()
+    return count
 
 
 def get_task_by_id(chat_id: int, task_id: int) -> dict | None:
